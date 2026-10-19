@@ -202,7 +202,8 @@ button, input, select { font: inherit; color: inherit; }
 .pc.dragging { z-index: 10; }
 .pc.dragging .pcard { cursor: grabbing; box-shadow: 0 24px 50px rgba(0, 0, 0, .6); }
 .pc.leaving { pointer-events: none; }
-body.dragging, body.dragging * { cursor: grabbing !important; }
+/* Only the body and the dragged card change cursor: a universal selector here would restyle the whole page when a drag starts. */
+body.dragging, body.dragging .pc.dragging .pcard { cursor: grabbing; }
 body.dragging .pool .pcard:hover { border-color: #24312b; }
 
 /* ---------------------------------------------------------------- results sheet */

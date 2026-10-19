@@ -592,8 +592,29 @@ export function createDraft({ actions, toast, onTurnBlocked }) {
     layer.style.display = on ? '' : 'none';
     if (on) requestAnimationFrame(() => {
       if (!geo.cardRatio) { const probe = makePitchCard(PLAYERS[0].id); geo.cardRatio = probe.offsetHeight / geo.cardW; probe.remove(); pcs.delete(PLAYERS[0].id); }
+      warmUp();
       placeAll(false); markFormation(false); renderPool();
     });
+  }
+
+  // Run the first drag's one-time work (card creation, spring easing generation, WAAPI setup) ahead of time,
+  // off-screen, so the first real drag doesn't drop a frame.
+  let warmed = false;
+  function warmUp() {
+    if (warmed) return;
+    warmed = true;
+    const run = () => {
+      const id = PLAYERS[PLAYERS.length - 1].id;
+      if (pcs.has(id)) return;
+      const el = makePitchCard(id);
+      el.style.visibility = 'hidden';
+      el.style.transform = tf(-9999, -9999);
+      pcs.delete(id);
+      const a = animate(el.querySelector('.inner'), { transform: 'scale(1.07) rotate(-2.5deg)' }, { type: spring, stiffness: 500, damping: 26 });
+      const b = animate(el, { transform: [tf(-9999, -9999), tf(-9990, -9990)] }, SPRING);
+      Promise.all([a.finished, b.finished]).finally(() => el.remove());
+    };
+    (window.requestIdleCallback || (f => setTimeout(f, 200)))(run);
   }
 
   let resizeRaf = 0;
