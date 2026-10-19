@@ -155,7 +155,9 @@ a.btn { color: var(--text); text-decoration: none; display: inline-block; }
 .m-score .tm i { width: 22px; height: 5px; border-radius: 3px; background: var(--kit); }
 .m-score .sc { font-size: 30px; font-weight: 950; font-variant-numeric: tabular-nums; letter-spacing: -.02em; }
 .m-score .min { grid-column: 1 / -1; text-align: center; color: var(--muted); font-size: 12px; font-weight: 700; }
-.m-panel { flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain; }
+.m-panel { flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain; contain: strict; }
+/* Off-screen commentary rows skip layout/paint, so new rows don't re-lay-out the whole list. */
+.m-panel .feed-item { content-visibility: auto; contain-intrinsic-size: auto 44px; }
 .feed-item { display: grid; grid-template-columns: 44px 1fr; gap: 8px; padding: 7px 4px; border-bottom: 1px solid rgba(34, 48, 42, .6); font-size: 12.5px; }
 .feed-item .fm { font-weight: 800; color: var(--muted); font-variant-numeric: tabular-nums; }
 .feed-item.big { background: linear-gradient(90deg, color-mix(in srgb, var(--c) 22%, transparent), transparent); border-radius: 8px; }

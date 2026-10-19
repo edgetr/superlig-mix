@@ -106,7 +106,8 @@ export function createMatchScreen({ client, api, getSess, toast, serverNow }) {
     const seekW = $('#mSeek').clientWidth;
     $('#mProg').style.transform = `scaleX(${Math.min(1, t / total)})`;
     $('#mKnob').style.transform = `translateX(${Math.min(1, t / total) * seekW}px)`;
-    $('#mTime').textContent = `${fmtT(t)} / ${match.complete ? fmtT(dur) : fmtT(dur) + '…'}`;
+    const label = `${fmtT(t)} / ${match.complete ? fmtT(dur) : fmtT(dur) + '…'}`;
+    if (label !== updateProgress.label) { updateProgress.label = label; $('#mTime').textContent = label; }
   }
   function updateBuffer() {
     $('#mBuf').style.transform = `scaleX(${match.complete ? 1 : 0.999})`;
@@ -247,14 +248,22 @@ export function createMatchScreen({ client, api, getSess, toast, serverNow }) {
       const tl = match.timeline ? match.timeline() : [];
       const shown = tl.filter(s => s.kind === 'ev' && s.start <= t && s.itemIndex >= 0);
       if (!force && shown.length === lastFeedLen) return;
-      const grew = shown.length > lastFeedLen && lastFeedLen >= 0;
-      lastFeedLen = shown.length;
-      panel.innerHTML = shown.length ? shown.slice().reverse().map(s => {
+      const row = s => {
         const d = items[s.itemIndex]?.data || {};
         const c = d.side === 'A' ? room.host.color : d.side === 'B' ? room.guest.color : '#888';
         return `<div class="feed-item${BIG.has(d.type) ? ' big' : ''}" style="--c:${c}"><span class="fm">${esc(s.minute || '')}</span><span class="ft">${ICON[d.type] ? `<span class="ic">${ICON[d.type]}</span>` : ''}${esc(d.text || '')}</span></div>`;
-      }).join('') : `<p class="muted" style="text-align:center;margin-top:30px">${room.sim.state === 'error' ? esc(room.sim.error) : 'Kick-off soon…'}</p>`;
-      if (grew && panel.firstElementChild) animate(panel.firstElementChild, { opacity: [0, 1], transform: ['translateY(-8px)', 'translateY(0)'] }, { duration: 0.3 });
+      };
+      // Normal playback only appends: insert just the new rows at the top instead of rebuilding the list.
+      if (!force && lastFeedLen > 0 && shown.length > lastFeedLen && panel.querySelector('.feed-item')) {
+        const fresh = shown.slice(lastFeedLen).reverse();
+        panel.insertAdjacentHTML('afterbegin', fresh.map(row).join(''));
+        lastFeedLen = shown.length;
+        animate(panel.firstElementChild, { opacity: [0, 1], transform: ['translateY(-8px)', 'translateY(0)'] }, { duration: 0.3 });
+        return;
+      }
+      lastFeedLen = shown.length;
+      panel.innerHTML = shown.length ? shown.slice().reverse().map(row).join('')
+        : `<p class="muted" style="text-align:center;margin-top:30px">${room.sim.state === 'error' ? esc(room.sim.error) : 'Kick-off soon…'}</p>`;
       return;
     }
     if (!force) return;
