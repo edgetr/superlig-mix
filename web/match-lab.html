@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Match renderer lab</title>
+<style>
+  html, body { margin: 0; background: #070b09; color: #eef4f0; font: 14px/1.4 system-ui, -apple-system, sans-serif; }
+  .wrap { max-width: 1320px; margin: 0 auto; padding: 16px; display: flex; flex-direction: column; gap: 10px; }
+  canvas { width: 100%; aspect-ratio: 16 / 9; background: #0b130e; border-radius: 12px; display: block; }
+  .controls { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  button { font: inherit; color: inherit; background: #18221d; border: 1px solid #2c3a33; padding: 7px 12px; border-radius: 8px; cursor: pointer; }
+  button.on { background: #eef4f0; color: #08100c; }
+  input[type=range] { flex: 1; min-width: 200px; }
+  .info { font-variant-numeric: tabular-nums; color: #9fb7a8; }
+  progress { width: 220px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <canvas id="cv" width="1280" height="720"></canvas>
+  <div class="controls">
+    <button id="play">Pause</button>
+    <input id="scrub" type="range" min="0" max="1000" value="0">
+    <span class="info" id="time">0:00</span>
+    <button data-speed="1" class="on">1×</button><button data-speed="2">2×</button><button data-speed="4">4×</button>
+    <label><input type="checkbox" id="stream"> simulate streaming</label>
+    <button id="export">Export video</button><progress id="prog" max="1" value="0" hidden></progress>
+  </div>
+  <div class="info" id="info"></div>
+</div>
+<script type="module" src="/src/match/lab.js"></script>
+</body>
+</html>

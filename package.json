@@ -1,0 +1,20 @@
+{
+  "name": "superlig-mix",
+  "version": "1.0.0",
+  "description": "Two-player Süper Lig draft: pick your XI turn by turn, then watch GPT-6 Luna simulate the match minute by minute.",
+  "license": "MIT",
+  "type": "module",
+  "bin": { "superlig-mix": "companion/host.mjs" },
+  "files": ["companion", "shared"],
+  "scripts": {
+    "dev": "vite web",
+    "build": "vite build web --emptyOutDir",
+    "preview": "vite preview web",
+    "host": "node companion/host.mjs",
+    "convex:dev": "convex dev",
+    "convex:deploy": "convex deploy"
+  },
+  "engines": { "node": ">=20" },
+  "dependencies": { "convex": "^1.47.0" },
+  "devDependencies": { "vite": "^7.0.0", "motion": "^14.4.0", "mediabunny": "^1.61.6" }
+}

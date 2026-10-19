@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Süper Lig Mix — Draft Duel</title>
+<meta name="description" content="Draft a Süper Lig XI against a friend, turn by turn, then watch GPT-6 Luna simulate the match minute by minute.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%23e30a17'/%3E%3Ctext x='32' y='42' font-family='Arial' font-weight='900' font-size='26' text-anchor='middle' fill='white'%3ETSL%3C/text%3E%3C/svg%3E">
+<link rel="stylesheet" href="/src/style.css">
+<link rel="stylesheet" href="/src/duel.css">
+</head>
+<body>
+<!-- ============================================================ DRAFT (the Starting XI UI) -->
+<header class="bar" id="bar">
+  <div class="brand">
+    <span class="badge">TSL</span>
+    <div class="brand-text">
+      <input id="teamName" class="team-name" maxlength="28" spellcheck="false" aria-label="Team name">
+      <span class="sub" id="subline">Draft duel</span>
+    </div>
+  </div>
+
+  <div class="formations" id="formations" role="radiogroup" aria-label="Formation"></div>
+
+  <div class="bar-right">
+    <div class="turn" id="turnChip"></div>
+    <div class="xi-value" title="Total market value of your XI">
+      <span class="lbl">XI value</span>
+      <span class="num" id="xiValue">€0</span>
+    </div>
+    <div class="xi-count"><span id="xiCount">0</span>/11</div>
+    <button class="room-chip" id="roomChip" title="Copy invite link"></button>
+    <div id="aiChip"></div>
+    <button id="mainAction" class="btn guess" disabled><span class="guess-label">Ready</span><span class="guess-sub"></span></button>
+  </div>
+</header>
+
+<main class="stage" id="stage">
+  <section class="pitch-area" id="pitchArea">
+    <div class="pitch-tabs" id="pitchTabs" role="tablist">
+      <button role="tab" data-v="me" aria-selected="true">My XI</button>
+      <button role="tab" data-v="rival" aria-selected="false">Rival XI</button>
+    </div>
+    <div class="pitch" id="pitch"></div>
+    <p class="pitch-hint" id="pitchHint"></p>
+  </section>
+
+  <aside class="side">
+    <div class="side-head">
+      <div class="pick-feed" id="pickFeed"></div>
+      <div class="chips" id="clubChips"></div>
+      <div class="chips" id="posChips"></div>
+      <div class="side-tools">
+        <input id="search" type="search" placeholder="Search player or club…" autocomplete="off">
+        <select id="sort" aria-label="Sort players">
+          <option value="value">Value ↓</option>
+          <option value="name">Name A–Z</option>
+          <option value="club">Club</option>
+        </select>
+        <label class="hide-taken"><input type="checkbox" id="hideTaken"> Hide taken</label>
+      </div>
+    </div>
+    <div class="pool" id="pool"></div>
+  </aside>
+</main>
+
+<div class="layer" id="layer"></div>
+
+<!-- ============================================================ HOME -->
+<section class="screen home" id="home" hidden>
+  <div class="home-bg" aria-hidden="true"></div>
+  <div class="home-card">
+    <div class="home-title"><span class="badge big">TSL</span><div><h1>Süper Lig Mix</h1><p>Draft Duel · 2026/27</p></div></div>
+    <p class="home-lede">Two managers, one player pool. Take turns drafting a starting XI from the Süper Lig — whoever you pick is gone for your rival. Then GPT-6 Luna plays the match out minute by minute.</p>
+    <label class="field"><span>Your name</span><input id="yourName" maxlength="24" placeholder="e.g. Ege" autocomplete="nickname"></label>
+    <div class="home-actions">
+      <button class="btn primary big" id="createBtn">Create a game <small>you'll be the host</small></button>
+      <div class="join-box">
+        <input id="joinCode" maxlength="5" placeholder="CODE" autocomplete="off" spellcheck="false" aria-label="Game code">
+        <button class="btn big" id="joinBtn">Join</button>
+      </div>
+    </div>
+    <ol class="how">
+      <li><b>Draft</b> — host picks first, then you alternate until both have 11. Any position, any order.</li>
+      <li><b>Ready</b> — the joining player presses Ready, the host presses Simulate.</li>
+      <li><b>Watch</b> — GPT-6 Luna (high reasoning, on the host's ChatGPT plan) simulates the match on a neutral ground. Pause, rewind, and download it as a video.</li>
+    </ol>
+    <p class="home-foot">Open source · <a href="https://github.com/edgetr/superlig-mix" target="_blank" rel="noopener">github.com/edgetr/superlig-mix</a> · Player data &amp; photos: transfermarkt.com</p>
+  </div>
+</section>
+
+<!-- ============================================================ LOBBY -->
+<section class="screen lobby" id="lobby" hidden>
+  <div class="lobby-card">
+    <p class="eyebrow">Game code</p>
+    <div class="big-code" id="bigCode"></div>
+    <div class="invite">
+      <button class="btn" id="copyCode">Copy code</button>
+      <button class="btn" id="copyLink">Copy invite link</button>
+    </div>
+    <div class="managers">
+      <div class="mgr" id="mgrHost"></div>
+      <div class="vs">VS</div>
+      <div class="mgr" id="mgrGuest"></div>
+    </div>
+    <div class="lobby-row" id="timerRow">
+      <span>Pick timer</span>
+      <div class="seg" id="timerSeg"></div>
+    </div>
+    <div class="lobby-row" id="aiRow"></div>
+    <div class="lobby-actions" id="lobbyActions"></div>
+    <button class="link-btn" id="leaveBtn">Leave game</button>
+  </div>
+</section>
+
+<!-- ============================================================ LINE-UPS (after Simulate) -->
+<section class="screen lineups" id="lineups" hidden>
+  <div class="lu-head">
+    <span class="chip-neutral">Neutral ground · no home advantage</span>
+    <h2 id="luTitle"></h2>
+    <p class="lu-status" id="luStatus"></p>
+  </div>
+  <div class="lu-body">
+    <div class="lu-team" id="luA"></div>
+    <div class="lu-vs" id="luVs">VS</div>
+    <div class="lu-team" id="luB"></div>
+  </div>
+  <div class="lu-foot" id="luFoot"></div>
+</section>
+
+<!-- ============================================================ MATCH -->
+<section class="screen match" id="match" hidden>
+  <div class="m-main">
+    <div class="m-video" id="mVideo">
+      <canvas id="matchCanvas" width="1280" height="720"></canvas>
+      <div class="m-wait" id="mWait" hidden><div class="spin"></div><span id="mWaitText"></span></div>
+      <button class="m-bigplay" id="mBigPlay" hidden aria-label="Play">▶</button>
+    </div>
+    <div class="m-controls">
+      <button class="icon" id="mPlay" aria-label="Play/Pause">❚❚</button>
+      <button class="icon" id="mRestart" aria-label="Restart" title="Restart">⟲</button>
+      <div class="m-seek" id="mSeek"><div class="m-buf" id="mBuf"></div><div class="m-prog" id="mProg"></div><div class="m-marks" id="mMarks"></div><div class="m-knob" id="mKnob"></div></div>
+      <span class="m-time" id="mTime">0:00</span>
+      <div class="seg small" id="mSpeed"></div>
+      <button class="btn" id="mDownload" disabled>⬇ Video</button>
+      <button class="icon" id="mFull" aria-label="Fullscreen" title="Fullscreen">⛶</button>
+    </div>
+  </div>
+  <aside class="m-side">
+    <div class="m-score" id="mScore"></div>
+    <div class="m-tabs seg" id="mTabs"></div>
+    <div class="m-panel" id="mPanel"></div>
+    <div class="m-foot" id="mFoot"></div>
+  </aside>
+</section>
+
+<!-- Modal (Connect ChatGPT etc.) -->
+<div class="sheet" id="modal" hidden>
+  <div class="sheet-backdrop" data-close></div>
+  <div class="sheet-panel small" role="dialog" aria-modal="true">
+    <button class="sheet-close" data-close aria-label="Close">✕</button>
+    <div id="modalBody"></div>
+  </div>
+</div>
+
+<div class="toast" id="toast" hidden></div>
+
+<script type="module" src="/src/main.js"></script>
+</body>
+</html>
