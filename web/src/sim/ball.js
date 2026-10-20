@@ -92,8 +92,9 @@ function frame(b, px, py, ev) {
         b.x = gx + nx * (R + POST_R); b.z = GOAL_H + nz * (R + POST_R);
       }
     }
-    // Crossing the goal line between the posts, under the bar → goal; then the net holds it.
-    const crossed = (px - gx) * s < 0 && (b.x - gx) * s >= 0;
+    // The whole ball over the goal line between the posts, under the bar → goal (Law 10); then
+    // the net holds it.
+    const crossed = (px - gx) * s < R && (b.x - gx) * s >= R;
     if (crossed && b.y > POST_A + R * 0.5 && b.y < POST_B - R * 0.5 && b.z < GOAL_H) { b.inNet = s; if (ev) ev.goal = gx; }
     if (b.inNet === s) {
       const depth = NET_BOT + (NET_TOP - NET_BOT) * Math.min(1, b.z / GOAL_H);

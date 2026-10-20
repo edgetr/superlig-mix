@@ -1020,18 +1020,37 @@ export function createMatch({ teams }) {
     });
     const shot = c.marks.shot;
     if (shot && sc.ev.type === 'shot') D.worldArrow(ctx, cam, posAt(c, shot.agent, shot.t) || shot.from, shot.to, '#ff4d57', { width: 4.5 });
-    // Offside line
+    // Offside check, as broadcast: frozen as the ball is played; a line on the second-last
+    // defender, a line on the attacker, the gap between them shaded and measured (Law 11).
     const off = c.marks.offside;
     if (off) {
-      const tk = Math.round(off.t * HZ);
+      const tk = clamp(Math.round(off.t * HZ), 0, c.N - 1);
       const defSide = off.sideAtt === 'A' ? 'B' : 'A';
       const lineX = defSide === (sc.M.dir.A > 0 ? 'B' : 'A') ? c.offX[tk * 2 + 1] : c.offX[tk * 2];
-      D.worldLine(ctx, cam, lineX, -1, lineX, C.WD + 1, '#38bdf8', 3.5);
       const rp = posAt(c, off.runner, off.t);
-      if (rp) { D.worldLine(ctx, cam, rp.x, -1, rp.x, C.WD + 1, '#ff4d57', 3, [10, 7]); }
-      D.project(cam, lineX, 2, 0, pj);
-      ctx.fillStyle = '#38bdf8'; ctx.font = `800 13px ${FONT}`; ctx.textAlign = 'center';
-      ctx.fillText('LAST DEFENDER', pj[0], pj[1] - 8);
+      const dirAtt = sc.M.dir[off.sideAtt];
+      // who sets the line: the defender nearest it (or the ball, if it's further forward)
+      let setter = null, bd = 0.6;
+      for (let a = defSide === 'A' ? 0 : 11, e = a + 11; a < e; a++) { const q = posAt(c, a, off.t); if (q && q.x > -20 && Math.abs(q.x - lineX) < bd) { bd = Math.abs(q.x - lineX); setter = a; } }
+      if (rp) {
+        const margin = (rp.x - lineX) * dirAtt;
+        // shaded offside gap
+        const quad = [[lineX, -0.5], [rp.x, -0.5], [rp.x, C.WD + 0.5], [lineX, C.WD + 0.5]].map(([x, y]) => D.project(cam, x, y, 0.02, [0, 0, 0]));
+        ctx.save(); ctx.fillStyle = margin > 0 ? 'rgba(255,77,87,0.28)' : 'rgba(56,189,248,0.22)';
+        ctx.beginPath(); quad.forEach((q, i) => (i ? ctx.lineTo(q[0], q[1]) : ctx.moveTo(q[0], q[1]))); ctx.closePath(); ctx.fill(); ctx.restore();
+        D.worldLine(ctx, cam, rp.x, -0.5, rp.x, C.WD + 0.5, '#ff4d57', 3.5);
+        // measured gap, at the attacker
+        D.project(cam, rp.x, clamp(rp.y + 4, 2, C.WD - 2), 0, pj);
+        const txt = margin > 0.05 ? `OFFSIDE · ${margin.toFixed(2)} m` : 'ONSIDE';
+        ctx.font = `900 16px ${FONT}`; const tw = ctx.measureText(txt).width + 22;
+        ctx.fillStyle = margin > 0.05 ? '#ff4d57' : '#38bdf8'; D.roundRect(ctx, pj[0] - tw / 2, pj[1] - 14, tw, 28, 6); ctx.fill();
+        ctx.fillStyle = '#fff'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillText(txt, pj[0], pj[1] + 1);
+      }
+      D.worldLine(ctx, cam, lineX, -0.5, lineX, C.WD + 0.5, '#38bdf8', 3.5);
+      D.project(cam, lineX, 1.5, 0, pj);
+      const who = setter != null ? `SECOND-LAST DEFENDER · ${surname(allLooks()[setter]?.name || '').toUpperCase()}` : 'LINE OF THE BALL';
+      ctx.fillStyle = '#38bdf8'; ctx.font = `800 13px ${FONT}`; ctx.textAlign = 'center'; ctx.textBaseline = 'alphabetic';
+      ctx.fillText(who, pj[0], pj[1] - 8);
     }
     // Spotlights + chips on the protagonists
     const prot = (c.info.protagonists || []).filter(a => a != null).slice(0, 3);

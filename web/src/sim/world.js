@@ -682,7 +682,9 @@ function tackleCmd(w, ag) {
   const d = Math.hypot(px - ag.x, py - ag.y);
   // a foul has to make contact: commit only when the slide/lunge will actually get there
   const closing = o.outcome === 'foul' ? (speedOf(tg) < speedOf(ag) + 1.5 || d < 1.6) : true;
-  if (w.t >= (o.notBefore ?? 0) && d < (o.style === 'slide' ? 3.0 : 1.5) && closing) {
+  // (a foul that must stay outside the penalty area waits until he's outside it)
+  const outside = !o.maxU || uOf(w, o.maxU.side, tg) + (tg.vx * w.M.dir[o.maxU.side]) * 0.4 < o.maxU.u;
+  if (w.t >= (o.notBefore ?? 0) && d < (o.style === 'slide' ? 3.0 : 1.5) && closing && outside) {
     o.committed = true; o.ct = w.t;
     const [ux, uy] = unit(px - ag.x, py - ag.y);
     const v = o.style === 'slide' ? Math.max(5.2, speedOf(ag), speedOf(tg) + 1.8) : Math.max(2.8, speedOf(tg) + 1);
@@ -1062,7 +1064,7 @@ function strike(w, ag) {
   w.owner = -1; w.lastTouch = ag.id; ag.lastTouchT = w.t;
   w.flight = { kicker: ag.id, receiver: o.to ?? -1, kind, t0: w.t, T, target: tgt, from };
   if (o.type === 'pass' || o.type === 'cross') w.marks.passes.push({ from: ag.id, to: o.to ?? -1, t0: w.t, t1: w.t + T, target: { x: tgt.x, y: tgt.y }, loft: kind === 'ground' || kind === 'through' ? 0 : Math.max(1, (v.vz * v.vz) / 19.6) });
-  emit(w, 'kick', { agent: ag.id, kind, ktype: o.type, to: o.to ?? -1, target: tgt, T, from });
+  emit(w, 'kick', { agent: ag.id, kind, ktype: o.type, to: o.to ?? -1, target: tgt, T, from, lineU: w.line[ag.side] });
   ag.order = null; ag.intent = null;
 }
 

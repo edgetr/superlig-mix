@@ -571,7 +571,7 @@ function* openPlay(w, ev, side, shooter, assister, SL, head, outcome) {
     // (a goal that will be ruled out for offside: he's already a yard beyond the line when it's crossed)
     const hold = W(offsideGoal ? Math.min(lineU() + 1.6, 99) : Math.min(clamp(SL.u - 8, 80, 90), lineU() - 1), clamp(SL.v + (A.v > 34 ? -3 : 3), 18, 50));
     order(w, shooter, { type: 'run', hold, to: spot0, go: false });
-    const second = byRoles(M, side, ['ST', 'LW', 'RW', 'CAM', 'CM'], w.sent, [shooter, final])[0];
+    const second = offsideGoal ? null : byRoles(M, side, ['ST', 'LW', 'RW', 'CAM', 'CM'], w.sent, [shooter, final])[0];
     if (second != null) order(w, second, { type: 'run', hold: W(86, A.v > 34 ? 30 : 38), to: W(type === 'cross' ? 97 : 91, A.v > 34 ? 28 : 40), go: false });
     // runners start as he shapes to cross
     order(w, shooter, { type: 'goto', to: { x: lerp(hold.x, spot0.x, 0.35), y: lerp(hold.y, spot0.y, 0.35) }, speed: 4.2, faceBall: true, keepFace: false });
@@ -598,19 +598,24 @@ function* openPlay(w, ev, side, shooter, assister, SL, head, outcome) {
       const hv = toTeam(dir, hold.x, hold.y).v;
       order(w, shooter, { type: 'goto', to: W(Math.min(lineU() + 1.5, 99), hv), speed: 7, faceBall: true, keepFace: false });
       if (w.agents[m1]?.order?.type === 'mark') order(w, m1, null);
-      trap = byRoles(M, opp, ['CB', 'LB', 'RB', 'LWB', 'RWB'], w.sent);
+      // everyone in their back line (and anyone who has dropped into it) steps up together
+      trap = M.teams[opp].players.filter(p => p.role !== 'GK' && !w.sent.has(p.agent)).map(p => p.agent);
+      // the cross is only released while he's (still) beyond the line as it will be struck
       yield* until(w, () => {
-        const ru = uOf(w, side, shooterA), stepTo = Math.max(ru - 1.6, 70);
+        // they squeeze up to just behind him, but stay goal-side of the ball
+        const ru = uOf(w, side, shooterA), stepTo = Math.max(ru - 1.6, uOf(w, side, w.ball) + 4, 70);
         const so = shooterA.order;
-        if (so?.type === 'goto') { so.to = W(Math.min(lineU() + 1.5, 99), hv); const far = lineU() - ru > 6; so.speed = far ? 7 : 3.2; so.keepFace = !far; }
-        if (lineU() - ru > 4) return false;           // the trap only springs once he's up there
+        if (so?.type === 'goto') { so.to = W(Math.min(Math.max(lineU() + 1.5, uOf(w, side, w.ball) + 6.5), 99), hv); const far = lineU() - ru > 6; so.speed = far ? 7 : 3.2; so.keepFace = !far; }
         for (const d of trap) {
           const ag = w.agents[d], v0 = toTeam(dir, ag.x, ag.y).v;
-          if (!ag.free) order(w, d, { type: 'goto', to: W(Math.min(uOf(w, side, ag), stepTo), v0), speed: 3.6, faceBall: true, keepFace: true });
+          if (!ag.free && uOf(w, side, ag) > stepTo - 0.5) order(w, d, { type: 'goto', to: W(Math.min(uOf(w, side, ag), stepTo), v0), speed: 3.6, faceBall: true, keepFace: true });
+          else if (ag.order?.type === 'goto') order(w, d, null);
         }
-        return ru > lineU() + 0.8;
-      }, 7);
-      if (w.agents[final].order === o) o.notBefore = w.t;
+        const ruNext = uOf(w, side, { x: shooterA.x + shooterA.vx * 0.35, y: shooterA.y + shooterA.vy * 0.35 });
+        const ok = lineU() - ru < 4 && ruNext > lineU() + 1.1 && ru > lineU() + 0.6;
+        if (w.agents[final].order === o) { o.notBefore = ok ? w.t : w.t + 5; o.pace = ok ? null : 0.8; }   // he holds it up, waiting
+        return !!since(w, tDel, 'commit', e => e.agent === final);
+      }, 9);
     }
     const cm = since(w, tDel, 'commit', e => e.agent === final) || (yield* waitEvent(w, 'commit', e => e.agent === final, 6));
     // he winds up: runners go, and the ball is aimed where the finisher will actually be
@@ -620,7 +625,7 @@ function* openPlay(w, ev, side, shooter, assister, SL, head, outcome) {
     if (o) o.target = { x: spot.x, y: spot.y, z: o.target.z };
     order(w, shooter, { type: 'run', hold, to: spot, go: true, arrive: (cm ? cm.t : w.t) + avail });
     if (second != null) { const o2 = w.agents[second].order; if (o2?.type === 'run') o2.go = true; }
-    const kd = yield* waitEvent(w, 'kick', e => e.agent === final, 2);
+    const kd = since(w, tDel, 'kick', e => e.agent === final) || (yield* waitEvent(w, 'kick', e => e.agent === final, 2));
     for (const d of trap) if (w.agents[d].order?.type === 'goto') order(w, d, null);
     if (offsideGoal && kd) w.marks.offside = { t: kd.t, runner: shooter, lineU: lineU(), sideAtt: side, passer: final };
     w.marks.assist = { from: { x: ass.x, y: ass.y }, to: spot, type };
@@ -956,7 +961,9 @@ function* foulScript(w, ev, info) {
   let offender = findAgent(M, opp, ev.offender);
   const { u, v } = evLoc(ev, 70, 34);
   const pen = ev.penalty === true || inBox(u, v);
-  const F = toWorld(dir, pen ? clamp(u, 89, 102) : Math.min(u, 88), v);
+  // (a foul that isn't a penalty happens outside the area — Law 14 would make it one otherwise)
+  const nearBox = !pen && v > 11 && v < 57;
+  const F = toWorld(dir, pen ? clamp(u, 89, 102) : Math.min(u, nearBox ? 85.5 : 100), v);
   if (offender == null || w.sent.has(offender)) offender = pick(M, opp, ['CB', 'CDM', 'LB', 'RB', 'CM'], w.sent);
   w.allowLoose = true; w.protect = side;
   // build-up: they work it to him a few metres short of the spot
@@ -968,9 +975,19 @@ function* foulScript(w, ev, info) {
   yield* possession(w, side, { objective: before, final: fouled, budget: 4, minPasses: 1, maxPasses: 3, tempo: M.teams[side].style.tempo, arriveR: 2.5 });
   // he drives at the defender; the defender goes in
   const sliding = rnd() < 0.55;
-  order(w, fouled, { type: 'dribble', to: { x: F.x + (dir > 0 ? 4 : -4), y: F.y }, speed: 6.4 });
-  order(w, offender, { type: 'tackle', target: fouled, style: sliding ? 'slide' : 'lunge', outcome: 'foul', notBefore: w.t + 0.3 });
-  const f = yield* waitEvent(w, 'foul', () => true, 9);
+  const Fu = toTeam(dir, F.x, F.y).u;
+  const runTo = pen ? toWorld(dir, Fu + 4, v) : nearBox ? toWorld(dir, Math.min(Fu + 2, 87), v + (v < 34 ? 6 : -6)) : toWorld(dir, Math.min(Fu + 4, 103), v);
+  order(w, fouled, { type: 'dribble', to: runTo, speed: 6.4 });
+  order(w, offender, { type: 'tackle', target: fouled, style: sliding ? 'slide' : 'lunge', outcome: 'foul', notBefore: w.t + 0.3, maxU: nearBox ? { side, u: 87.3 } : null });
+  const fa = w.agents[fouled], tF = w.t;
+  // near the area he goes across the edge of it, not into it
+  const f = yield* until(w, () => {
+    if (nearBox && w.owner === fouled && uOf(w, side, fa) > 84.5 && fa.order?.type === 'dribble') {
+      const fv = toTeam(dir, fa.x, fa.y).v;
+      fa.order.to = toWorld(dir, 83, fv + (fv < 34 ? 10 : -10)); fa.order.speed = 4.5;
+    }
+    return since(w, tF, 'foul');
+  }, 9);
   w.protect = null;
   const tf = f ? f.t : w.t;
   info.climax = tf; info.protagonists = [fouled, offender]; info.offender = offender; info.fouled = fouled;
@@ -1002,7 +1019,8 @@ function* foulScript(w, ev, info) {
     if (card === 'red') order(w, offender, { type: 'goto', to: { x: at.x, y: 70 }, speed: 2.2 });
   }
   // restart set-up: the ball is stopped where it ran to (free kick there), players walk to their positions
-  if (!pen) { yield* until(w, () => Math.hypot(w.ball.vx, w.ball.vy) < 0.3, 1.5); restart.x = clamp(w.ball.x, 1, L - 1); restart.y = clamp(w.ball.y, 1, WD - 1); setDead(w, restart, side); }
+  // Law 13: the free kick is taken from where the offence happened
+  if (!pen) { yield* until(w, () => Math.hypot(w.ball.vx, w.ball.vy) < 0.3, 1.5); restart.x = clamp(at.x, 1, L - 1); restart.y = clamp(at.y, 1, WD - 1); setDead(w, restart, side); }
   const sent2 = new Set(w.sent); if (card === 'red') sent2.add(offender);
   const w2 = { ...w, sent: sent2 };
   if (pen) {
@@ -1037,19 +1055,51 @@ function* offsideScript(w, ev, info) {
   const passSpot = toWorld(dir, 58 + rnd() * 8, clamp(34 + (rnd() - 0.5) * 14, 14, 54));
   w.allowLoose = true; w.protect = side;
   yield* possession(w, side, { objective: passSpot, final: passer, budget: 3.5, minPasses: 1, maxPasses: 2, avoid: [runner], arriveR: 4 });
-  // the runner goes too early: a yard beyond the last defender as the ball is played
+  // Law 11: he is offside if, when the ball is played, he is in the opponents' half and nearer
+  // their goal line than both the ball and the second-last opponent. The striker sits on the last
+  // defender's shoulder, the back line holds (and steps up as the passer looks up), he goes too
+  // early — and the pass is played while he's a yard beyond them.
+  if (w.owner < 0) yield* waitEvent(w, 'control', e => w.agents[e.agent].side === side, 2.5);
+  if (w.owner >= 0 && w.agents[w.owner].side === side && w.owner !== runner) passer = w.owner;   // whoever has it plays it
   const lineU = () => w.line[side];
-  const hold = toWorld(dir, lineU() + 1.8 + rnd(), clamp(v, 10, 58));
-  order(w, runner, { type: 'run', hold, to: toWorld(dir, Math.min(lineU() + 14, 99), clamp(v, 10, 58)), go: false });
-  yield* until(w, () => uOf(w, side, w.agents[runner]) > lineU() + 1.2, 3);
-  const target = toWorld(dir, Math.min(lineU() + 11, 98), clamp(v, 10, 58));
-  order(w, passer, { type: 'pass', to: runner, kind: 'through', target, vArr: 6, minHold: 0.1 });
-  const cm = yield* waitEvent(w, 'commit', e => e.agent === passer, 4);
-  const o = w.agents[runner].order; if (o) o.go = true;
-  const k = yield* waitEvent(w, 'kick', e => e.agent === passer, 2);
+  const ra = w.agents[runner];
+  const lv = clamp(v, 10, 58);
+  order(w, runner, { type: 'goto', to: toWorld(dir, lineU() - 1.2, lv), speed: 6.5, faceBall: true, keepFace: false });
+  if (w.owner === passer) order(w, passer, { type: 'dribble', to: towards(w, w.agents[passer], toWorld(dir, 90, lv), 6), speed: 2.6 });
+  yield* until(w, () => { const o = ra.order; if (o?.type === 'goto') o.to = toWorld(dir, lineU() - 1.2, lv); return Math.abs(uOf(w, side, ra) - (lineU() - 1.2)) < 2.2; }, 4);
+  const target = toWorld(dir, Math.min(lineU() + 12, 98), lv);
+  const pass = w.owner === passer ? order(w, passer, { type: 'pass', to: runner, kind: 'through', target, vArr: 6, minHold: 0.1, notBefore: w.t + 8 }) : null;
+  // the back line holds and squeezes up
+  const trap = byRoles(M, opp, ['CB', 'LB', 'RB', 'LWB', 'RWB'], w.sent);
+  const hold = () => { for (const d of trap) { const ag = w.agents[d]; if (ag.free) continue; order(w, d, { type: 'goto', to: toWorld(dir, Math.max(55, uOf(w, side, ag) - 0.6), toTeam(dir, ag.x, ag.y).v), speed: 3, faceBall: true, keepFace: true }); } };
+  hold();
+  // he goes when the passer has set himself to play it (head up, body open)
+  yield* until(w, () => {
+    const pa = w.agents[passer], o = pa.order;
+    if (w.k % 6 === 0) hold();
+    if (!o || o !== pass) return true;
+    const kd = Math.atan2(target.y - w.ball.y, target.x - w.ball.x);
+    return pa.kick && Math.abs(angDiff(pa.face, kd)) < 0.7 && Math.hypot(w.ball.x - pa.x, w.ball.y - pa.y) < 1.1;
+  }, 2.5);
+  order(w, runner, { type: 'run', to: target, go: true, speed: ra.vmax * 0.9 });
+  // play it once he'll still be beyond the line when the boot meets the ball (0.3 s on)
+  yield* until(w, () => {
+    if (w.k % 6 === 0) hold();
+    const ruNext = uOf(w, side, { x: ra.x + ra.vx * 0.3, y: ra.y + ra.vy * 0.3 });
+    return ruNext > lineU() + 1.0 && uOf(w, side, ra) > 52.5;
+  }, 4);
+  if (pass && w.agents[passer].order === pass) pass.notBefore = w.t;
+  else {
+    // the ball moved on in the meantime: whoever has it now plays it in
+    if (w.owner < 0) yield* waitEvent(w, 'control', e => w.agents[e.agent].side === side, 2);
+    if (w.owner >= 0 && w.agents[w.owner].side === side && w.owner !== runner) { passer = w.owner; order(w, passer, { type: 'pass', to: runner, kind: 'through', target: toWorld(dir, Math.min(uOf(w, side, ra) + 8, 98), lv), vArr: 6, minHold: 0.05 }); }
+  }
+  const k = yield* waitEvent(w, 'kick', e => e.agent === passer, 5);
+  for (const d of trap) if (w.agents[d].order?.type === 'goto') { order(w, d, null); if (w.rnd() < 0.6) setAnim(w, d, S.APPEAL, 1.4); }
   const tp = k ? k.t : w.t;
+  const offenceAt = { x: ra.x, y: ra.y };            // where he was when it was played
   info.climax = tp; info.protagonists = [runner, passer]; info.runner = runner;
-  w.marks.offside = { t: tp, runner, lineU: lineU(), sideAtt: side, passer };
+  w.marks.offside = { t: tp, runner, lineU: k?.lineU ?? lineU(), sideAtt: side, passer };
   // flag
   yield* wait(w, 0.5);
   const flagger = target.x > L / 2 ? AR_FAR : AR_NEAR;
@@ -1062,10 +1112,10 @@ function* offsideScript(w, ev, info) {
   yield* wait(w, 0.6);
   setAnim(w, runner, S.APPEAL, 1.6);
   order(w, runner, { type: 'goto', to: w.agents[runner], speed: 1.5 });
-  // indirect free kick: the defender takes it from where the ball stopped
+  // indirect free kick to the defending team, from where he was when the ball was played (Law 11)
   if (w.owner >= 0) order(w, w.owner, { type: 'stay' });
   yield* until(w, () => Math.hypot(w.ball.vx, w.ball.vy) < 0.4, 1.2);
-  const ifk = { x: w.ball.x, y: w.ball.y };
+  const ifk = { x: clamp(offenceAt.x, 1, L - 1), y: clamp(offenceAt.y, 1, WD - 1) };
   setDead(w, ifk, opp);
   const def = nearestOf(w, opp, ifk, ['CB', 'LB', 'RB']);
   order(w, def, { type: 'goto', to: { x: ifk.x + dir * 1.4, y: ifk.y }, speed: 3.5, faceBall: true });
