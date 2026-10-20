@@ -9,9 +9,11 @@ import { L, WD, GOAL_W, GOAL_H, POST_A, POST_B, HZ, N_AGENTS, S } from '../../si
 import { loadAssets, makeSkeleton } from './assets.js';
 import { createKitMaterial, numberTexture } from './kit.js';
 import { createFaces } from './face.js';
+import { createHairMaterial, INFLATE_UNDER } from './hair.js';
 import { createController } from './controller.js';
 
 const ASPECT = 16 / 9;
+const HEAD_SCALE = 1.045;
 let singleton = null;
 
 export function getStage() { return (singleton ||= createStage()); }
@@ -183,12 +185,21 @@ async function createStage() {
       hand.add(flag);
     }
     scene.add(g);
-    people.push({ g, mesh, bones, mat, u: mat.userData.uniforms, card, flag });
+    // Real hair (hair.js): hangs from the head bone, shown only in close-ups (see draw()).
+    const hb = body.bones[body.idx.Head].head;
+    const hair = new THREE.Mesh(new THREE.BufferGeometry(), createHairMaterial());
+    hair.position.set(-hb[0], -hb[1], -hb[2]);
+    hair.frustumCulled = false; hair.visible = false; hair.castShadow = false;
+    bones[body.idx.Head].add(hair);
+    // Footballers' heads read a touch bigger than the MakeHuman default next to a kit.
+    bones[body.idx.Head].scale.setScalar(HEAD_SCALE);
+    people.push({ g, mesh, bones, mat, u: mat.userData.uniforms, card, flag, hair, hairGeo: null });
   }
 
   // ---------------------------------------------------------------- per-match cast (kits, faces)
   // Faces are baked once per photo (face.js): head texture, head shape, hair volume and colours.
   const faces = createFaces(renderer, body);
+  const uploadRT = new THREE.WebGLRenderTarget(1, 1), uploadMat = new THREE.MeshBasicMaterial();
   let castKey = null, cast = null;
   const eyeL0 = people[0].u.uEyeL.value.clone(), eyeR0 = people[0].u.uEyeR.value.clone();
   function applyHead(a) {
@@ -202,9 +213,11 @@ async function createStage() {
       u.uIris.value.copy(f.iris); u.uSclera.value.copy(f.sclera);
       u.uEyeL.value.copy(f.eyes[0]); u.uEyeR.value.copy(f.eyes[1]);
       p.mesh.geometry = f.geo;
+      p.hairGeo = f.hairGeo || null;
+      if (p.hairGeo) p.hair.geometry = p.hairGeo;
       return;
     }
-    u.uHasFace.value = 0; p.mesh.geometry = body.geo;
+    u.uHasFace.value = 0; p.mesh.geometry = body.geo; p.hairGeo = null; p.hair.visible = false; u.uHairInflate.value = 1;
     u.uSkin.value.set(lk.skin || '#c8956b'); u.uHasHair.value = lk.hair ? 1 : 0; if (lk.hair) u.uHair.value.set(lk.hair);
     u.uHairTop.value = 0.012; u.uHairSide.value = 0.006;
     u.uIris.value.set('#3a2416'); u.uSclera.value.set('#d9d2cb');
@@ -241,6 +254,13 @@ async function createStage() {
     faces.retain(new Set(imgs), new Set(people.map(p => p.u.uFace.value)));
     await faces.prepare(imgs);
     if (cast) for (let a = 0; a < N_AGENTS; a++) applyHead(a);
+    // Upload the hair geometry now rather than on the first close-up.
+    const up = new THREE.Mesh(undefined, uploadMat); up.frustumCulled = false;
+    const sc = new THREE.Scene(); sc.add(up);
+    const prevRT = renderer.getRenderTarget();
+    renderer.setRenderTarget(uploadRT);
+    for (const img of imgs) { const f = faces.get(img); if (f?.hairGeo && !f.hairGeo.userData.uploaded) { up.geometry = f.hairGeo; renderer.render(sc, cam3); f.hairGeo.userData.uploaded = true; } }
+    renderer.setRenderTarget(prevRT);
   }
 
   // ---------------------------------------------------------------- per-frame
@@ -283,6 +303,39 @@ async function createStage() {
     key.target.updateMatrixWorld();
   }
 
+  // Hair LOD: real hair only when the head is big on screen (close-ups); otherwise the baked head
+  // texture and the shader's hair volume. Sway: the tips trail the body's acceleration (from the
+  // engine track, so replays and exports sway the same way every time).
+  const HAIR_PX = 34;
+  const sway = new THREE.Vector3();
+  function trackAt(clip, ag, tt, out) {
+    const f = Math.max(0, Math.min(clip.N - 1, tt * HZ)), i0 = Math.floor(f), i1 = Math.min(i0 + 1, clip.N - 1), u = f - i0;
+    out[0] = clip.pos[(i0 * N_AGENTS + ag) * 2] * (1 - u) + clip.pos[(i1 * N_AGENTS + ag) * 2] * u;
+    out[1] = clip.pos[(i0 * N_AGENTS + ag) * 2 + 1] * (1 - u) + clip.pos[(i1 * N_AGENTS + ag) * 2 + 1] * u;
+    return out;
+  }
+  const tp0 = [0, 0], tp1 = [0, 0], tp2 = [0, 0];
+  function hairLod(p, ag, r, clip, t, h) {
+    if (!p.hairGeo) return;
+    const sc = p.g.scale.x;
+    const dx = cam3.position.x - r.x, dy = cam3.position.y - 1.62 * sc, dz = cam3.position.z - r.y;
+    const px = (0.23 * sc / Math.max(0.3, Math.hypot(dx, dy, dz))) / Math.tan((cam3.fov * Math.PI) / 360) * (h / 2);
+    const on = px > HAIR_PX;
+    p.hair.visible = on;
+    p.u.uHairInflate.value = on ? INFLATE_UNDER : 1;
+    if (!on) return;
+    const dt = 0.1;
+    trackAt(clip, ag, t, tp0); trackAt(clip, ag, t - dt, tp1); trackAt(clip, ag, t - 2 * dt, tp2);
+    const vx = (tp0[0] - tp1[0]) / dt, vy = (tp0[1] - tp1[1]) / dt;
+    const ax = (tp0[0] - 2 * tp1[0] + tp2[0]) / (dt * dt), ay = (tp0[1] - 2 * tp1[1] + tp2[1]) / (dt * dt);
+    // engine x,y → three X,Z; then into the body's frame (group yaw)
+    let wx = -vx * 0.0011 - ax * 0.0022, wz = -vy * 0.0011 - ay * 0.0022;
+    const l = Math.hypot(wx, wz); if (l > 0.018) { wx *= 0.018 / l; wz *= 0.018 / l; }
+    const yaw = p.g.rotation.y, c = Math.cos(-yaw), s = Math.sin(-yaw);
+    sway.set(wx * c + wz * s, -0.15 * l, -wx * s + wz * c);
+    p.hair.material.uniforms.uSway.value.copy(sway);
+  }
+
   // Draw one engine frame into a 2D context. opts: { only:Set, transparent, ripple, looksFoot }
   const v3 = new THREE.Vector3();
   function draw(ctx, cam, clip, t, opts = {}) {
@@ -312,6 +365,7 @@ async function createStage() {
       p.bones[0].position.set(r.pose.r[0], r.pose.r[1], r.pose.r[2]);
       p.g.position.set(r.x, 0, r.y);
       p.g.rotation.y = Math.PI / 2 - r.yaw;
+      hairLod(p, ag, r, clip, t, h);
       // props
       if (p.card) {
         const st = clip.st[i * N_AGENTS + ag];
@@ -339,7 +393,10 @@ async function createStage() {
   function warm() {
     renderer.setSize(Math.max(canvas.width, 1280), Math.max(canvas.height, 720), false);
     cam3.position.set(L / 2, 29, WD + 48); cam3.lookAt(L / 2, 0, 29);
+    // the hair shader too (hair is hidden until a close-up; compiling it then would stall a frame)
+    people[0].hair.visible = true;
     renderer.compile(scene, cam3);
+    people[0].hair.visible = false;
   }
   warm();
 

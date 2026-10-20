@@ -6,6 +6,7 @@ import { FaceLandmarker, ImageSegmenter } from '@mediapipe/tasks-vision';
 import classicLoader from '@mediapipe/tasks-vision/vision_wasm_internal.js?url';
 import classicWasm from '@mediapipe/tasks-vision/vision_wasm_internal.wasm?url';
 import { fitPhoto } from './faceFit.js';
+import { buildHair } from './hairGen.js';
 
 let base = '/', models = null, head = null, fitData = null;
 
@@ -125,11 +126,19 @@ self.onmessage = async ({ data: m }) => {
       const px = cx.getImageData(0, 0, a.w, a.h).data;
       const heuristic = !a.lm;
       fit = fitPhoto({ ...a, lm: a.lm || framingLandmarks(px, a.w, a.h), px, heuristic }, head, fitData);
+      // Real hair, beard and eyebrows on the reshaped head (hairGen.js).
+      try {
+        const nv = head.idx.length, pos = new Float32Array(nv * 3);
+        for (let i = 0; i < nv * 3; i++) pos[i] = head.P[i] + fit.off[i];
+        const seed = Math.round((fit.params.hair[0] * 977 + fit.params.skin[1] * 7919 + fit.params.hairTop * 1e5) * 1000);
+        fit.hair = buildHair(head, { pos, nrm: head.N, hairW: fit.hairW, beardD: fit.beardD, browPts: fit.browPts, params: fit.params }, seed);
+      } catch (e) { console.warn('hair failed', e); fit.hair = null; }
     }
     m.bitmap.close?.();
     const tr = [];
     if (a.lm) tr.push(a.lm.buffer);
     if (fit) for (const v of Object.values(fit)) if (ArrayBuffer.isView(v)) tr.push(v.buffer);
+    if (fit?.hair) for (const v of Object.values(fit.hair)) if (ArrayBuffer.isView(v)) tr.push(v.buffer);
     self.postMessage({ id: m.id, ok: a.ok, w: a.w, h: a.h, lm: a.lm, hair: m.wantHair ? a.hair : null, fit, ms: performance.now() - t0 }, [...new Set(tr)]);
   } catch (e) {
     console.warn('face analysis failed', e);

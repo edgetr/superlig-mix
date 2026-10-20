@@ -279,7 +279,87 @@ export function fitPhoto(a, head, fitData) {
   for (let x = 0; x < w; x += 3) for (const y of [1, 3]) if (hairAt(x, y) < 0.2 && personAt(x, y) < 0.5) bgS.push(sample(x, y));
   const bg = bgS.length ? [0, 1, 2].map(k => median(bgS.map(c => c[k]))) : [0.5, 0.5, 0.5];
 
+  // ---------------------------------------------------------------- hair style (for the 3D hair)
+  // Curliness from the structure tensor of the hair (straight hair has one clear strand direction,
+  // curls have none), the strand direction over the front of the head, and how far hair hangs below
+  // the ears beside the neck (long hair, dreads).
+  const style = { curl: 0, coh: 0, vert: 0.5, hang: 0, ropes: 0 };
+  if (hasHairMask && !bald) {
+    const Lm = new Float32Array(w * h);
+    for (let i = 0; i < w * h; i++) Lm[i] = Math.sqrt(0.2126 * lin[px[i * 4]] + 0.7152 * lin[px[i * 4 + 1]] + 0.0722 * lin[px[i * 4 + 2]]);
+    const Txx = new Float32Array(w * h), Tyy = new Float32Array(w * h), Txy = new Float32Array(w * h);
+    for (let y = 1; y < h - 1; y++) for (let x = 1; x < w - 1; x++) {
+      const i = y * w + x, gx = Lm[i + 1] - Lm[i - 1], gy = Lm[i + w] - Lm[i - w];
+      Txx[i] = gx * gx; Tyy[i] = gy * gy; Txy[i] = gx * gy;
+    }
+    const rb2 = Math.max(2, Math.round(eyeDist * 0.11));
+    boxBlur(Txx, w, h, rb2); boxBlur(Tyy, w, h, rb2); boxBlur(Txy, w, h, rb2);
+    const q10 = Q(10);
+    let cs = 0, cw = 0, vs = 0, vw = 0;
+    for (let y = 2; y < h - 2; y++) for (let x = 2; x < w - 2; x++) {
+      const i = y * w + x;
+      if (a.hair[i] < 180) continue;
+      const up = (x - q10[0]) * upI[0] + (y - q10[1]) * upI[1];
+      if (up < -eyeDist * 0.1) continue;                       // the head's top and front only
+      const tr = Txx[i] + Tyy[i];
+      if (tr < 1e-5) continue;
+      const coh = Math.sqrt((Txx[i] - Tyy[i]) ** 2 + 4 * Txy[i] ** 2) / tr;
+      cs += coh * tr; cw += tr;
+      // strand direction is across the gradient: its alignment with the face's up axis
+      const th = 0.5 * Math.atan2(2 * Txy[i], Txx[i] - Tyy[i]);
+      const sx = -Math.sin(th), sy = Math.cos(th);
+      if (up > 0 && up < eyeDist * 0.9 && coh > 0.3) { vs += Math.abs(sx * upI[0] + sy * upI[1]) * tr; vw += tr; }
+    }
+    style.coh = cw ? cs / cw : 0.5;
+    style.curl = clamp((0.42 - style.coh) / 0.2, 0, 1);
+    style.vert = vw ? vs / vw : 0.5;
+    // Hair hanging beside the jaw and neck, below the ear lobes: there is nothing else of the person
+    // there (the neck is narrower than the jaw, the shoulders are lower), so person pixels a little
+    // outside the jaw line are hair (the hair segmenter often misses dreads and long hair).
+    let hang = 0, stripes = 0, sn = 0;
+    for (const sgn of [1, -1]) {
+      let last = 1.575;
+      for (let y = 1.565; y > 1.455; y -= 0.008) {
+        let cov = 0, n = 0;
+        for (let dx = 0.0; dx < 0.03; dx += 0.005) {
+          const q = warp([sgn * (0.068 + dx), y, head.zc - 0.01]);
+          if (q[0] < 0 || q[0] >= w || q[1] < 0 || q[1] >= h) continue;
+          cov += Math.max(a.person ? personAt(q[0], q[1]) : 0, hairAt(q[0], q[1])); n++;
+        }
+        if (n && cov / n > 0.45) last = y; else break;
+      }
+      hang = Math.max(hang, 1.575 - last);
+      const q = warp([sgn * 0.08, 1.53, head.zc - 0.01]);
+      let prev = null;
+      for (let dx = -eyeDist * 0.25; dx <= eyeDist * 0.25; dx += 1) {
+        const x = q[0] + dx, y = q[1];
+        if (x < 0 || x >= w || y < 0 || y >= h) continue;
+        const l = Lm[Math.round(y) * w + Math.round(x)];
+        if (prev != null) { stripes += Math.abs(l - prev); sn++; }
+        prev = l;
+      }
+    }
+    // A run all the way down to the shoulders: shoulder-length or longer.
+    if (hang > 0.09) hang = 0.16;
+    style.hang = hang > 0.03 ? hang : 0;
+    style.ropes = sn > 10 ? stripes / sn : 0;
+  }
+  // Eyebrows: colour (darkest half of the brow pixels) and their place on the 3D head.
+  const browPoly = side => { const b = side ? LM.browL : LM.browR; return [...b.slice(0, 5), ...b.slice(5)].map(i => [lm[i * 3], lm[i * 3 + 1]]); };
+  const browPx = [];
+  for (const side of [0, 1]) {
+    const poly = browPoly(side), bb = bbox(poly, 1);
+    for (let y = Math.floor(bb[1]); y <= bb[3]; y++) for (let x = Math.floor(bb[0]); x <= bb[2]; x++) if (inPoly(x + 0.5, y + 0.5, poly)) browPx.push(sample(x, y));
+  }
+  browPx.sort((p, q) => lum(p) - lum(q));
+  const browDark = browPx.slice(0, Math.max(1, browPx.length >> 1));
+  const brow = browDark.length ? [0, 1, 2].map(k => median(browDark.map(c => c[k]))) : hair;
+  const browContrast = clamp(1 - lum(brow) / Math.max(1e-4, lum(skin)), 0, 1);
+
   // ---------------------------------------------------------------- per-vertex outputs
+  const beardD = new Float32Array(nv);
+  const lipsPoly = LM.lips.map(i => [lm[i * 3], lm[i * 3 + 1]]);
+  const noseY = F[2] ? F[2][1] : 1.572;
   const uv = new Float32Array(nv * 2), vis = new Float32Array(nv), cap = new Float32Array(nv), hw = new Float32Array(nv), bw = new Float32Array(nv), off = new Float32Array(nv * 3);
   const chin = head.head.chin;
   const jaw = JAW.filter(i => F[i]).map(i => F[i]);
@@ -308,6 +388,12 @@ export function fitPhoto(a, head, fitData) {
       for (let j = 0; j + 1 < jaw.length; j++) { const r = segDist(P, jaw[j], jaw[j + 1]); if (r.d < best) { best = r.d; by = r.y; } }
       if (P[1] < by + 0.002) bw[k] = beardK * (1 - ss(0.008, 0.04, best));
     }
+    // Facial hair density from the photo: darker than the skin on the lower face (not the lips).
+    if (head.R[k] === 0 && !isEar && vis[k] > 0.3 && P[1] < noseY - 0.004 + (Math.abs(P[0]) > 0.032 ? 0.016 : 0) && P[1] > chin - 0.02 && !inPoly(q[0], q[1], lipsPoly)) {
+      const yv = lum(disc(q[0], q[1], rs));
+      beardD[k] = clamp((Ys * 0.78 - yv) / (Ys * 0.45), 0, 1);
+    }
+    beardD[k] = Math.max(beardD[k], bw[k]);
     // Shape: the face takes the player's proportions; fades out to the back of the head and neck.
     if (head.R[k] === 5) { const e = eyeOff[P[0] > 0 ? 0 : 1]; off.set(e, k * 3); }
     else {
@@ -350,8 +436,10 @@ export function fitPhoto(a, head, fitData) {
   }
 
   return {
-    uv, vis, cap, hairW: hw, beardW: bw, off, masks, eyeOff,
+    uv, vis, cap, hairW: hw, beardW: bw, beardD, off, masks, eyeOff,
+    browPts: [...LM.browR, ...LM.browL].map(i => { const o = shapeOff(F[i], 1); return [F[i][0] + o[0], F[i][1] + o[1], F[i][2] + o[2]]; }),
     params: {
+      style, brow, browContrast,
       shineT, chroma,
       heuristic: !!a.heuristic, bg, skin, hair, hairSide, beard, beardK, iris, sclera, bald, coverage, long, hairTop, hairSideVol, front,
       light: [lc[0] / meanShade, lc[1] / meanShade, lc[2] / meanShade, lc[3] / meanShade], delight: DELIGHT,

@@ -90,9 +90,14 @@ async function compareMode() {
   })));
   const A = 25, N = Math.ceil(2 * HZ) + 1;
   const clip = { N, dur: (N - 1) / HZ, pos: new Float32Array(N * A * 2), hd: new Float32Array(N * A), ph: new Float32Array(N * A), st: new Uint8Array(N * A), stT: new Float32Array(N * A), ball: new Float32Array(N * 3), cam: new Float32Array(N * 2), marks: { passes: [], captions: [] } };
+  // ?run=<m/s>: jog/run/sprint in place of standing; ?ball=side: ball to his left (head turns).
+  const v = Number(qs.get('run') || 0);
+  const GAIT = [[0, 0.9], [1.3, 1.46], [2.93, 2.31], [3.65, 2.67], [4.44, 3.02], [4.83, 3.1], [6.5, 3.75], [9.5, 4.6]];
+  const cyc = v => { for (let i = 1; i < GAIT.length; i++) if (v <= GAIT[i][0]) { const [a, la] = GAIT[i - 1], [b, lb] = GAIT[i]; return la + ((v - a) / (b - a)) * (lb - la); } return 4.6; };
   for (let k = 0; k < N; k++) {
-    for (let a = 0; a < A; a++) { clip.pos[(k * A + a) * 2] = a < sel.length ? 20 + a * 4 : -40; clip.pos[(k * A + a) * 2 + 1] = 34; clip.hd[k * A + a] = 0; }
-    clip.ball[k * 3] = 140; clip.ball[k * 3 + 1] = 34; clip.ball[k * 3 + 2] = 0;
+    const tt = k / HZ;
+    for (let a = 0; a < A; a++) { clip.pos[(k * A + a) * 2] = a < sel.length ? 20 + a * 4 + v * tt : -40; clip.pos[(k * A + a) * 2 + 1] = 34; clip.hd[k * A + a] = 0; clip.ph[k * A + a] = v ? (v * tt) / cyc(v) : 0; }
+    clip.ball[k * 3] = qs.get('ball') === 'side' ? 20 + v * tt : 140; clip.ball[k * 3 + 1] = qs.get('ball') === 'side' ? 50 : 34; clip.ball[k * 3 + 2] = 0;
   }
   const looks = Array.from({ length: A }, (_, a) => {
     const p = sel[a];
@@ -113,10 +118,19 @@ async function compareMode() {
   if (atlas) cv.width += TH;
   const THREE_ = await import('three');
   const hp = new THREE_.Vector3(), hq = new THREE_.Quaternion(), fwd = new THREE_.Vector3();
-  sel.forEach((p, i) => {
+  for (const [i, p] of sel.entries()) {
     const img = imgs.get(p.id);
     if (img) ctx.drawImage(img, 0, i * TH, TW, TH);
     const fo = stage.faces.get(img);
+    if (qs.has('mask') && img) {
+      const d = await detectFace(await createImageBitmap(img));
+      if (d.hair) {
+        const id = new ImageData(d.w, d.h);
+        for (let k = 0; k < d.w * d.h; k++) { id.data[k * 4] = 255; id.data[k * 4 + 3] = d.hair[k] > 128 ? 110 : 0; }
+        const mc = document.createElement('canvas'); mc.width = d.w; mc.height = d.h; mc.getContext('2d').putImageData(id, 0, 0);
+        ctx.drawImage(mc, 0, i * TH, TW, TH);
+      }
+    }
     if (qs.has('overlay') && fo?.debug) {
       const d = fo.debug;
       for (let k = 0; k < d.vis.length; k++) {
@@ -153,7 +167,7 @@ async function compareMode() {
     const pitch = 0; fwd.y = 0; fwd.normalize();
     const base = Math.atan2(fwd.z, fwd.x);
     const sc = stage.people[0].g.scale.x;
-    const c = hp.clone().add(new THREE_.Vector3(0, 0.07 * sc, 0)).addScaledVector(fwd, 0.03 * sc);
+    const c = hp.clone().add(new THREE_.Vector3(0, Number(qs.get('dy') ?? 0.07) * sc, 0)).addScaledVector(fwd, 0.03 * sc);
     views.forEach((v, j) => {
       const ang = base + (v === 'front' ? 0 : v === '34' ? 0.7 : v === 'side' ? 1.5 : Number(v));
       // engine coords: x = X, y = Z, z = Y
@@ -177,8 +191,8 @@ async function compareMode() {
     }
     ctx.fillStyle = '#fff'; ctx.font = '14px system-ui'; ctx.fillText(p.name, 6, i * TH + 16);
     if (f) ctx.fillText(`${f.params.heuristic ? 'HEURISTIC ' : ''}${f.params.bald ? 'bald ' : ''}top ${(f.hairTop * 100).toFixed(1)}cm side ${(f.hairSide * 100).toFixed(1)}cm beard ${f.params.beardK.toFixed(2)} ${f.ms.toFixed(0)}ms`, 6, i * TH + 34);
-  });
+  }
   info.textContent = `prepare ${prepMs.toFixed(0)} ms`;
-  window.__params = sel.map(p => { const f = stage.faces.get(imgs.get(p.id)); return f && { name: p.name, workerMs: Math.round(f.ms), mainMs: +f.mainMs.toFixed(1), skin: '#' + f.skin.getHexString(), hair: '#' + f.hair.getHexString(), iris: '#' + f.iris.getHexString(), sclera: '#' + f.sclera.getHexString(), light: f.params.light.map(v => +v.toFixed(3)), bg: f.params.bg.map(v => +v.toFixed(3)), cov: +f.params.coverage.toFixed(2), long: +f.params.long.toFixed(2), front: f.params.front, beard: '#' + new THREE_.Color().setRGB(...f.params.beard, THREE_.LinearSRGBColorSpace).getHexString(), beardK: +f.params.beardK.toFixed(2)}; });
+  window.__params = sel.map(p => { const f = stage.faces.get(imgs.get(p.id)); return f && { name: p.name, hairInfo: f.hairGeo?.userData, style: Object.fromEntries(Object.entries(f.params.style).map(([k, v]) => [k, typeof v === "number" ? +v.toFixed(3) : v])), top: +f.hairTop.toFixed(3), side: +f.hairSide.toFixed(3), front: +f.params.front.toFixed(3), bald: f.params.bald, browC: +f.params.browContrast.toFixed(2), workerMs: Math.round(f.ms), mainMs: +f.mainMs.toFixed(1), skin: '#' + f.skin.getHexString(), hair: '#' + f.hair.getHexString(), iris: '#' + f.iris.getHexString(), sclera: '#' + f.sclera.getHexString(), light: f.params.light.map(v => +v.toFixed(3)), bg: f.params.bg.map(v => +v.toFixed(3)), cov: +f.params.coverage.toFixed(2), long: +f.params.long.toFixed(2), front: f.params.front, beard: '#' + new THREE_.Color().setRGB(...f.params.beard, THREE_.LinearSRGBColorSpace).getHexString(), beardK: +f.params.beardK.toFixed(2)}; });
   window.__done = true;
 }

@@ -13,6 +13,7 @@
 // Players without a photo, or whose photo can't be read, keep the plain procedural head.
 import * as THREE from 'three';
 import { headInfo, FACE_RECT } from './headModel.js';
+import { hairGeometry } from './hair.js';
 
 const BASE = import.meta.env?.BASE_URL || '/';
 const SIZE = 384;               // head atlas (whole head: hair, ears, neck)
@@ -51,7 +52,7 @@ export function createFaces(renderer, body) {
   let ready = null;
   const init = () => (ready ||= fitP.then(fit => {
     if (!fit) return false;
-    workerInit = { head: { idx: info.idx, P: info.P, N: info.N, UV: info.UV, R: info.R, zc: info.zc, head: info.head, eyes: info.eyes }, fit };
+    workerInit = { head: { idx: info.idx, P: info.P, N: info.N, UV: info.UV, R: info.R, zc: info.zc, head: info.head, eyes: info.eyes, local, bodyIndex: Uint16Array.from(bodyIndex) }, fit };
     if (worker) worker.postMessage({ type: 'init', base: BASE, ...workerInit }); else getWorker();
     return true;
   }));
@@ -239,12 +240,16 @@ export function createFaces(renderer, body) {
       const lin = c => new THREE.Color().setRGB(c[0], c[1], c[2], THREE.LinearSRGBColorSpace);
       const face = {
         tex: out.texture, rt: out, texHi: hi.texture, rtHi: hi, geo,
-        skin: lin(p.skin), hair: lin(p.hair), hasHair: !p.bald, hairTop: p.hairTop, hairSide: p.hairSideVol,
+        skin: lin(p.skin), hair: lin(p.hair), hasHair: !p.bald, hairTop: Math.min(0.022, p.hairTop), hairSide: p.hairSideVol,
         iris: lin(p.iris), sclera: lin(p.sclera),
         eyes: info.eyes.map((e, k) => { const o = f.eyeOff?.[k] || [0, 0, 0]; return new THREE.Vector4(e.c[0] + o[0], e.c[1] + o[1], e.c[2] + o[2], e.r); }),
         params: p, ms: r.ms, mainMs,
         debug: { uv: f.uv, vis: f.vis, hairW: f.hairW, R: info.R, UV: info.UV },
+        // for the hair geometry (hair.js)
+        hairW: f.hairW, beardD: f.beardD, browPts: f.browPts,
       };
+      // Real hair, beard and eyebrows, grown in the worker (hairGen.js).
+      face.hairGeo = f.hair ? hairGeometry(f.hair) : null;
       return face;
     })().catch(e => { console.warn('face failed', e); return null; }).then(f => { done.set(img, f); return f; });
     cache.set(img, pr);
@@ -259,7 +264,7 @@ export function createFaces(renderer, body) {
     retain(keep, inUse) {
       for (const [img, f] of done) {
         if (keep.has(img) || (f && inUse.has(f.tex))) continue;
-        if (f) { f.rt.dispose(); f.rtHi.dispose(); disposeOwn(f.geo); }
+        if (f) { f.rt.dispose(); f.rtHi.dispose(); disposeOwn(f.geo); f.hairGeo?.dispose(); }
         done.delete(img); cache.delete(img);
       }
     },

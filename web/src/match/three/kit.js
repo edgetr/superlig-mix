@@ -4,8 +4,21 @@
 // head's UV atlas, shaded eyeballs, and hair volume from a per-vertex hair weight.
 import * as THREE from 'three';
 
+// Broadcast fill for the players only: floodlights all around a stadium light faces and fronts
+// far more evenly than one key light can; a soft light from just above the camera (view space)
+// stands in for them without brightening the pitch. Shared by the kit and the hair materials.
+export const PLAYER_FILL = {
+  uFillCol: { value: new THREE.Color('#fff0e2').multiplyScalar(0.42) },
+  uFillDir: { value: new THREE.Vector3(0.25, 0.42, 1).normalize() },
+};
+export const FILL_GLSL = /* glsl */`
+uniform vec3 uFillCol;
+uniform vec3 uFillDir;
+vec3 playerFill(vec3 n) { return uFillCol * (0.3 + 0.7 * max(dot(n, uFillDir), 0.0)); }
+`;
+
 const VERT_DECL = /* glsl */`
-uniform float uSleeve, uShortsLen, uSockTop, uWaist, uHasHair, uHairTop, uHairSide;
+uniform float uSleeve, uShortsLen, uSockTop, uWaist, uHasHair, uHairTop, uHairSide, uHairInflate;
 attribute float region;
 attribute float armT;
 attribute float legT;
@@ -20,29 +33,43 @@ varying float vArm;
 varying float vLeg;
 varying vec2 vHeadUV;
 varying float vHairW;
+// Crew neck with a shallow V: height of a point above the collar line (> 0 neck skin, < 0 shirt),
+// measured around the neck axis (it leans forward); higher at the back like a real collar.
+float collarH(vec3 p) {
+  float axZ = 0.0085 + (p.y - 1.484) * 0.37;
+  vec2 d = vec2(p.x, p.z - axZ);
+  float rr = length(d);
+  float c = d.y / max(rr, 1e-4);
+  float lf = 1.446 - 0.016 * (1.0 - smoothstep(0.0, 0.04, abs(p.x))), lb = 1.488, ls = 1.47;
+  float line = ls + (lf - lb) * 0.5 * c + ((lf + lb) * 0.5 - ls) * c * c;
+  return rr > 0.115 ? -1.0 : p.y - line;
+}
 // Kit cloth sits a little off the skin: shirt ~1 cm, shorts ~2.5 cm (loose), socks ~0.4 cm.
 float clothInflate(float region, vec3 p, float arm, float leg) {
   float r = floor(region + 0.5);
   if (r > 0.5 && r < 1.5) {
-    float neck = smoothstep(0.065, 0.085, length(vec2(p.x, p.z - 0.0)));
+    float ch = collarH(p);
+    if (ch > 0.0) return 0.0;
+    float neck = smoothstep(0.0, 0.035, -ch);   // the collar hugs the neck
     float shorts = 1.0 - smoothstep(uWaist - 0.01, uWaist + 0.01, p.y);
     // A shirt hangs from the chest: fill the crease under the pecs and the waist so the cloth
     // reads as fabric, not skin.
     float front = smoothstep(0.1, 0.6, normal.z);
-    float crease = exp(-pow((p.y - 1.235) / 0.06, 2.0)) * 0.02 + smoothstep(1.24, 1.05, p.y) * smoothstep(0.95, 1.05, p.y) * 0.012;
-    float sides = exp(-pow((p.y - 1.12) / 0.12, 2.0)) * 0.014;
-    return mix(0.011 * (p.y > 1.40 ? neck : 1.0) + crease * front + sides, 0.024, shorts);
+    float crease = exp(-pow((p.y - 1.235) / 0.06, 2.0)) * 0.014 + smoothstep(1.24, 1.05, p.y) * smoothstep(0.95, 1.05, p.y) * 0.008;
+    float sides = exp(-pow((p.y - 1.12) / 0.12, 2.0)) * 0.01;
+    // Slim fit: close over the shoulders and chest, a little looser at the waist.
+    return mix(mix(0.0025, 0.007, neck) + crease * front + sides, 0.024, shorts);
   }
-  if (r > 1.5 && r < 2.5) return arm < uSleeve ? 0.012 : 0.0;
+  if (r > 1.5 && r < 2.5) return arm < uSleeve ? 0.0065 + 0.004 * smoothstep(0.1, 0.27, arm) : 0.0;
   if (r > 2.5 && r < 3.5) return leg < uShortsLen ? 0.026 * (1.0 - smoothstep(uShortsLen - 0.12, uShortsLen, leg) * 0.35) : (leg > uSockTop ? 0.004 : 0.0);
   if (r > 4.5) return 0.0;
   if (r > 3.5) return p.y < 0.11 ? 0.006 : 0.004;
   // Hair has volume: the scalp is pushed out where the hair is (thicker on top).
-  if (r < 0.5) return hairW * uHasHair * mix(uHairSide, uHairTop, smoothstep(0.1, 0.85, normal.y));
+  if (r < 0.5) return hairW * uHasHair * uHairInflate * mix(uHairSide, uHairTop, smoothstep(-0.4, 0.95, normal.y));
   return 0.0;
 }
 `;
-const FRAG_DECL = /* glsl */`
+const FRAG_DECL = FILL_GLSL + /* glsl */`
 varying vec3 vRest;
 varying vec3 vRestN;
 flat varying float vRegion;
@@ -58,6 +85,17 @@ uniform sampler2D uNum;
 uniform sampler2D uFace;   // baked head atlas (rgb albedo, a = 0.5 + hair / 2)
 uniform sampler2D uFaceHi; // baked front view of the face (same content, higher resolution)
 
+// (same as the vertex shader) Crew neck with a shallow V: height of a point above the collar line (> 0 neck skin, < 0 shirt),
+// measured around the neck axis (it leans forward); higher at the back like a real collar.
+float collarH(vec3 p) {
+  float axZ = 0.0085 + (p.y - 1.484) * 0.37;
+  vec2 d = vec2(p.x, p.z - axZ);
+  float rr = length(d);
+  float c = d.y / max(rr, 1e-4);
+  float lf = 1.446 - 0.016 * (1.0 - smoothstep(0.0, 0.04, abs(p.x))), lb = 1.488, ls = 1.47;
+  float line = ls + (lf - lb) * 0.5 * c + ((lf + lb) * 0.5 - ls) * c * c;
+  return rr > 0.115 ? -1.0 : p.y - line;
+}
 float edgeAA(float x, float e) { float w = fwidth(x) * 1.25 + 1e-4; return smoothstep(e - w, e + w, x); }
 
 vec3 headColor(inout float rough) {
@@ -110,13 +148,13 @@ vec3 kitColor(out float rough) {
   } else if (r > 4.5) {
     c = eyeColor(rough);
   } else if (r < 1.5) {
-    float nd = length(vec2(vRest.x, vRest.z - 0.0)) - mix(0.072, 0.085, step(0.0, vRest.z));
-    float shirt = 1.0 - (1.0 - edgeAA(nd, 0.0)) * edgeAA(vRest.y, uNeckY - 0.05);
+    float ch = collarH(vRest);
+    float shirt = 1.0 - edgeAA(ch, 0.0);
     float shorts = 1.0 - edgeAA(vRest.y, uWaist);
     vec3 sc = shirtColor();
     c = mix(uSkin, sc, shirt);
-    // Collar trim
-    float collar = shirt * (1.0 - edgeAA(nd, 0.016)) * edgeAA(vRest.y, uNeckY - 0.05);
+    // Ribbed collar band
+    float collar = shirt * edgeAA(ch, -0.011);
     c = mix(c, uTrim, collar * 0.9);
     rough = mix(0.5, 0.82, shirt);
     if (uHasNum > 0.5) {
@@ -163,6 +201,7 @@ vec3 kitColor(out float rough) {
 
 const col = h => new THREE.Color(h);
 
+
 export function createKitMaterial(body) {
   const u = {
     uShirt: { value: col('#c81e2c') }, uShirt2: { value: col('#ffffff') }, uShorts: { value: col('#ffffff') }, uSocks: { value: col('#c81e2c') },
@@ -170,7 +209,7 @@ export function createKitMaterial(body) {
     uGlove: { value: col('#f1f5f9') }, uTrim: { value: col('#ffffff') },
     uSleeve: { value: 0.27 }, uShortsLen: { value: 0.33 }, uSockTop: { value: 0.56 },
     uWaist: { value: 0.97 }, uNeckY: { value: 1.455 },
-    uHasHair: { value: 1 }, uHairTop: { value: 0.012 }, uHairSide: { value: 0.006 }, uHasGlove: { value: 0 }, uHasFace: { value: 0 }, uPattern: { value: 0 }, uHasNum: { value: 0 },
+    uHasHair: { value: 1 }, uHairTop: { value: 0.012 }, uHairSide: { value: 0.006 }, uHairInflate: { value: 1 }, uHasGlove: { value: 0 }, uHasFace: { value: 0 }, uPattern: { value: 0 }, uHasNum: { value: 0 },
     uIris: { value: col('#3a2416') }, uSclera: { value: col('#d9d2cb') },
     uEyeL: { value: eyeVec(body, 0) }, uEyeR: { value: eyeVec(body, 1) },
     uFaceXf: { value: new THREE.Vector4(1, 0, 1, 0) }, // unused (old planar photo mapping), kept for the labs
@@ -180,7 +219,7 @@ export function createKitMaterial(body) {
   const m = new THREE.MeshStandardMaterial({ roughness: 0.7, metalness: 0 });
   m.userData.uniforms = u;
   m.onBeforeCompile = sh => {
-    Object.assign(sh.uniforms, u);
+    Object.assign(sh.uniforms, u, PLAYER_FILL);
     sh.vertexShader = VERT_DECL + sh.vertexShader.replace('#include <begin_vertex>', `#include <begin_vertex>
       vRest = position; vRestN = normal; vRegion = region; vArm = armT; vLeg = legT; vHeadUV = headUV; vHairW = hairW; vFace = faceUVW;
       transformed += normal * clothInflate(region, position, armT, legT);`);
@@ -188,9 +227,11 @@ export function createKitMaterial(body) {
       .replace('#include <color_fragment>', `#include <color_fragment>
         float kitRough; diffuseColor.rgb = kitColor(kitRough);`)
       .replace('#include <roughnessmap_fragment>', `#include <roughnessmap_fragment>
-        roughnessFactor = kitRough;`);
+        roughnessFactor = kitRough;`)
+      .replace('#include <lights_fragment_end>', `#include <lights_fragment_end>
+        reflectedLight.indirectDiffuse += playerFill(normal) * material.diffuseColor;`);
   };
-  m.customProgramCacheKey = () => 'kit-v9';
+  m.customProgramCacheKey = () => 'kit-v12';
   return m;
 }
 

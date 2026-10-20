@@ -171,6 +171,39 @@ vuv.forEach((t, i) => { headUV[i * 2] = t[0]; headUV[i * 2 + 1] = t[1]; });
 const tris = [];
 for (const v of fv) for (let k = 1; k + 1 < v.length; k++) tris.push(v[0], v[k], v[k + 1]);
 const index = new Uint16Array(tris);
+// ---------------------------------------------------------------- athletic neck (cosmetic)
+// MakeHuman's neck is a thin tube (11 cm wide). Footballers have thick necks that flare into the
+// trapezius. Reshape only the surface (joints above are already computed, so the skeleton and every
+// animation stay identical): widen the neck around its axis (less at the throat), and raise the
+// trapezius so the neck runs down into the shoulders in a slope instead of meeting a flat shelf.
+{
+  const sm = (a, b, x) => { const t = Math.min(1, Math.max(0, (x - a) / (b - a))); return t * t * (3 - 2 * t); };
+  const bump = (a, m, b, x) => (x < m ? sm(a, m, x) : 1 - sm(m, b, x));
+  const neckSet = new Set(['Neck', 'Neck1']);
+  for (let i = 0; i < nV; i++) {
+    const src = verts[i];
+    if (src >= 14598) continue; // eyes
+    const d = domSrc[src];
+    let x = pos[i * 3], y = pos[i * 3 + 1], z = pos[i * 3 + 2];
+    const axZ = 0.0085 + (y - 1.484) * 0.37;
+    const rx = x, rz = z - axZ, r = Math.hypot(rx, rz) || 1;
+    // Neck: radial widening, strongest mid-neck, fading into the jaw line and the chest.
+    const isNeck = neckSet.has(d) || (d === 'Spine1' && y > 1.42) || (d === 'Head' && y < 1.548 && rz < 0.035);
+    if (isNeck && r < 0.11) {
+      const front = sm(0.2, 0.8, rz / r);                  // throat
+      const k = 0.2 * bump(1.425, 1.5, 1.575, y) * (1 - 0.55 * front) * (1 - sm(0.075, 0.11, r));
+      x += rx * k; z += rz * k;
+    }
+    // Trapezius: raise the top of the shoulders between neck and acromion, mostly at the back.
+    const ax = Math.abs(x);
+    if (y > 1.36 && y < 1.5 && ax > 0.03 && ax < 0.21 && z < 0.06) {
+      const back = 1 - sm(-0.01, 0.06, z);
+      y += 0.014 * bump(0.035, 0.085, 0.2, ax) * bump(1.37, 1.44, 1.5, y) * back;
+    }
+    pos[i * 3] = x; pos[i * 3 + 1] = y; pos[i * 3 + 2] = z;
+  }
+}
+
 // Smooth normals, accumulated per source vertex so split seam vertices share one normal.
 const nsrc = new Float64Array(V.length * 3);
 for (let t = 0; t < index.length; t += 3) {
