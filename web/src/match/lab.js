@@ -8,6 +8,7 @@ let match = createMatch({ teams: MOCK_TEAMS });
 match.setItems(MOCK_ITEMS);
 window.__lab = { createMatch, MOCK_TEAMS, MOCK_ITEMS, exportVideo, get match() { return match; }, W, H };
 await match.preload();
+await match.ready();
 window.__labReady = true;
 
 let t = 0, playing = true, speed = 1, last = performance.now(), streamN = MOCK_ITEMS.length;

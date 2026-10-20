@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Süper Lig Mix — Draft Duel</title>
-<meta name="description" content="Draft a Süper Lig XI against a friend, turn by turn, then watch GPT-6 Luna simulate the match minute by minute.">
+<meta name="description" content="Draft a Süper Lig XI against a friend, turn by turn, then watch GPT-6.1 Sol simulate the match minute by minute.">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%23e30a17'/%3E%3Ctext x='32' y='42' font-family='Arial' font-weight='900' font-size='26' text-anchor='middle' fill='white'%3ETSL%3C/text%3E%3C/svg%3E">
 <link rel="stylesheet" href="/src/style.css">
 <link rel="stylesheet" href="/src/duel.css">
@@ -48,14 +48,18 @@
   <aside class="side">
     <div class="side-head">
       <div class="pick-feed" id="pickFeed"></div>
-      <div class="chips" id="clubChips"></div>
-      <div class="chips" id="posChips"></div>
+      <div class="chips" id="leagueChips" aria-label="League"></div>
+      <div class="pos-row">
+        <div class="chips" id="posChips" aria-label="Position"></div>
+        <select id="clubSelect" aria-label="Club"></select>
+      </div>
       <div class="side-tools">
-        <input id="search" type="search" placeholder="Search player or club…" autocomplete="off">
+        <input id="search" type="search" placeholder="Search player, club or nationality…" autocomplete="off">
         <select id="sort" aria-label="Sort players">
           <option value="value">Value ↓</option>
           <option value="name">Name A–Z</option>
           <option value="club">Club</option>
+          <option value="age">Age ↑</option>
         </select>
         <label class="hide-taken"><input type="checkbox" id="hideTaken"> Hide taken</label>
       </div>
@@ -71,7 +75,7 @@
   <div class="home-bg" aria-hidden="true"></div>
   <div class="home-card">
     <div class="home-title"><span class="badge big">TSL</span><div><h1>Süper Lig Mix</h1><p>Draft Duel · 2026/27</p></div></div>
-    <p class="home-lede">Two managers, one player pool. Take turns drafting a starting XI from the Süper Lig — whoever you pick is gone for your rival. Then GPT-6 Luna plays the match out minute by minute.</p>
+    <p class="home-lede">Two managers, one player pool. Take turns drafting a starting XI from the Süper Lig — whoever you pick is gone for your rival. Then GPT-6.1 Sol plays the match out minute by minute.</p>
     <label class="field"><span>Your name</span><input id="yourName" maxlength="24" placeholder="e.g. Ege" autocomplete="nickname"></label>
     <div class="home-actions">
       <button class="btn primary big" id="createBtn">Create a game <small>you'll be the host</small></button>
@@ -83,7 +87,7 @@
     <ol class="how">
       <li><b>Draft</b> — host picks first, then you alternate until both have 11. Any position, any order.</li>
       <li><b>Ready</b> — the joining player presses Ready, the host presses Simulate.</li>
-      <li><b>Watch</b> — GPT-6 Luna (high reasoning, on the host's ChatGPT plan) simulates the match on a neutral ground. Pause, rewind, and download it as a video.</li>
+      <li><b>Watch</b> — GPT-6.1 Sol (high reasoning, on the host's ChatGPT plan) simulates the match on a neutral ground. Pause, rewind, and download it as a video.</li>
     </ol>
     <p class="home-foot">Open source · <a href="https://github.com/edgetr/superlig-mix" target="_blank" rel="noopener">github.com/edgetr/superlig-mix</a> · Player data &amp; photos: transfermarkt.com</p>
   </div>

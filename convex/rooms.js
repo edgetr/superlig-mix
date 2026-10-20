@@ -2,7 +2,7 @@ import { ConvexError, v } from 'convex/values';
 import { mutation, query, internalMutation } from './_generated/server';
 import { internal } from './_generated/api';
 import { PLAYERS } from '../shared/players.js';
-import { FORMATIONS, DEFAULT_FORMATION, KIT_COLORS, bestEmptySlot, remapXi } from '../shared/game.js';
+import { FORMATIONS, DEFAULT_FORMATION, KIT_COLORS, bestEmptySlot, remapXi, fitOf } from '../shared/game.js';
 
 const byId = new Map(PLAYERS.map(p => [p.id, p]));
 const CODE_CHARS = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
@@ -75,14 +75,19 @@ async function applyPick(ctx, room, role, playerId, slot, auto) {
   return { slot: i, pickNo };
 }
 
+// "Pick for me" / timer auto-pick: the most valuable available player who naturally fits an open
+// position in your formation (then an adapted fit, then anyone).
 function bestAvailable(room, role) {
   const taken = takenIds(room);
   const me = room[role];
-  // Highest market value that still fits an empty slot reasonably; ties → name.
+  const f = FORMATIONS[me.formation];
+  const open = f.map(([r], i) => (me.xi[i] ? null : r)).filter(Boolean);
   const free = PLAYERS.filter(p => !taken.has(p.id)).sort((a, b) => b.valueEur - a.valueEur || a.name.localeCompare(b.name));
-  const needGk = !me.xi.some((id, i) => id && FORMATIONS[me.formation][i][0] === 'GK') && count(me.xi) >= 9;
-  const pool = needGk ? free.filter(p => p.pos === 'Goalkeeper') : free;
-  return (pool[0] || free[0])?.id;
+  for (const want of ['natural', 'ok']) {
+    const hit = free.find(p => open.some(r => fitOf(p, r) === want));
+    if (hit) return hit.id;
+  }
+  return free[0]?.id;
 }
 
 // ------------------------------------------------------------------ lobby

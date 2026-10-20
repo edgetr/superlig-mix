@@ -3,19 +3,14 @@
 import { animate, spring, stagger } from 'motion';
 import { PLAYERS } from '../../shared/players.js';
 import { FORMATIONS, GROUP, roleOf, fitOf, bestEmptySlot } from '../../shared/game.js';
+import { CLUBS as CLUB_DATA, LEAGUES } from '../../shared/clubs.js';
 
 export const byId = new Map(PLAYERS.map(p => [p.id, p]));
 const $ = s => document.querySelector(s);
 
-export const CLUBS = {
-  gs:    { short: 'GS',  bg: '#a90432', fg: '#fdb912', line: '#a90432' },
-  fb:    { short: 'FB',  bg: '#0b2a6b', fg: '#ffed00', line: '#1d4fb8' },
-  bjk:   { short: 'BJK', bg: '#000000', fg: '#ffffff', line: '#e8e8e8' },
-  ts:    { short: 'TS',  bg: '#7a1c3a', fg: '#7cc4f0', line: '#7a1c3a' },
-  other: { short: '',    bg: '#4b5560', fg: '#ffffff', line: '#6b7680' },
-};
-const OTHER_SHORT = { 'Çorum FK': 'ÇOR', 'Amed SK': 'AMED', 'Gençlerbirliği': 'GB' };
-export const clubShort = p => CLUBS[p.club].short || OTHER_SHORT[p.clubName] || p.clubName.slice(0, 3).toUpperCase();
+export const CLUBS = CLUB_DATA;
+export { LEAGUES };
+export const clubShort = p => p.clubShort || CLUBS[p.club]?.short || p.clubName.slice(0, 3).toUpperCase();
 export const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 export function fmtEur(v) {
   if (v >= 1e9) return `€${(v / 1e9).toFixed(2)}bn`;
@@ -61,11 +56,16 @@ function fitFont(text, w, h, maxFs, minFs, weight = 700, lh = 1.12) {
 }
 
 function cardHTML(p, extra = '') {
-  return `<div class="ph"><img alt="" draggable="false" decoding="async" referrerpolicy="no-referrer" src="${p.img}"><span class="club">${esc(clubShort(p))}</span><span class="role">${roleOf(p)}</span>${extra}</div>
+  return `<div class="ph"><img alt="" draggable="false" decoding="async" referrerpolicy="no-referrer" src="${p.img}"><span class="club">${esc(clubShort(p))}</span><span class="role">${roleOf(p)}${p.num != null ? `<i class="num">#${p.num}</i>` : ''}</span>${extra}</div>
     <div class="meta"><div class="nm"><span>${esc(p.name)}</span></div><div class="val${p.value ? '' : ' none'}">${p.value || '—'}</div></div>`;
 }
+const FOOT = { right: 'right-footed', left: 'left-footed', both: 'two-footed' };
+export function playerTitle(p) {
+  const bits = [p.clubName, p.pos, p.num != null ? `#${p.num}` : null, p.age ? `${p.age} y/o` : null, p.nat, p.height ? `${(p.height / 100).toFixed(2)} m` : null, FOOT[p.foot], p.value];
+  return `${p.name} — ${bits.filter(Boolean).join(' · ')}`;
+}
 function styleClub(el, p) {
-  const c = CLUBS[p.club];
+  const c = CLUBS[p.club] || CLUBS.other;
   el.style.setProperty('--club-bg', c.bg);
   el.style.setProperty('--club-fg', c.fg);
   el.style.setProperty('--club-line', c.line);
@@ -106,22 +106,33 @@ export function createDraft({ actions, toast, onTurnBlocked }) {
     const el = document.createElement('div');
     el.className = 'pcard';
     el.dataset.id = p.id;
-    el.title = `${p.name} — ${p.clubName} · ${p.pos}${p.value ? ' · ' + p.value : ''}`;
+    el.title = playerTitle(p);
     styleClub(el, p);
     el.innerHTML = cardHTML(p);
     el.querySelector('img').loading = 'lazy';
     poolCards.set(p.id, el);
   });
 
-  let clubFilter = 'all', posFilter = 'all', sortBy = 'value';
+  let leagueFilter = 'all', clubFilter = 'all', posFilter = 'all', sortBy = 'value';
   const searchEl = $('#search');
-  const norm = s => s.toLocaleLowerCase('tr').replace(/ı/g, 'i').normalize('NFD').replace(/[̀-ͯ]/g, '');
+  const norm = s => s.toLocaleLowerCase('tr').replace(/ı/g, 'i').normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+  // Pre-normalised search text (name, club, nationality) so filtering stays cheap with 600+ cards.
+  const searchText = new Map(PLAYERS.map(p => [p.id, norm(`${p.name} ${p.clubName} ${p.nat || ''}`)]));
   function buildChips(container, items, get, set) {
     container.innerHTML = items.map(([k, label]) => `<button class="chip" data-k="${k}">${label}<span class="c"></span></button>`).join('');
     container.addEventListener('click', e => { const b = e.target.closest('.chip'); if (b) { set(b.dataset.k); renderPool(); } });
     return () => container.querySelectorAll('.chip').forEach(c => c.classList.toggle('on', c.dataset.k === get()));
   }
-  const markClub = buildChips($('#clubChips'), [['all', 'All'], ['gs', 'GS'], ['fb', 'FB'], ['bjk', 'BJK'], ['ts', 'TS'], ['other', 'Others']], () => clubFilter, v => { clubFilter = v; });
+  const markLeague = buildChips($('#leagueChips'), [['all', 'All'], ...LEAGUES.map(l => [l.key, l.name])], () => leagueFilter, v => { leagueFilter = v; clubFilter = 'all'; fillClubSelect(); });
+  const clubSel = $('#clubSelect');
+  function fillClubSelect() {
+    const keys = Object.keys(CLUBS).filter(k => PLAYERS.some(p => p.club === k) && (leagueFilter === 'all' || CLUBS[k].league === leagueFilter));
+    keys.sort((a, b) => CLUBS[a].name.localeCompare(CLUBS[b].name, 'tr'));
+    clubSel.innerHTML = `<option value="all">All clubs</option>` + keys.map(k => `<option value="${k}">${esc(k === 'other' ? 'Other Süper Lig' : CLUBS[k].name)}</option>`).join('');
+    clubSel.value = clubFilter;
+  }
+  fillClubSelect();
+  clubSel.addEventListener('change', () => { clubFilter = clubSel.value; renderPool(); });
   const markPos = buildChips($('#posChips'), [['all', 'All positions'], ['GK', 'GK'], ['DEF', 'DEF'], ['MID', 'MID'], ['FWD', 'FWD']], () => posFilter, v => { posFilter = v; });
   searchEl.addEventListener('input', () => renderPool());
   $('#sort').addEventListener('change', e => { sortBy = e.target.value; renderPool(true); });
@@ -132,6 +143,7 @@ export function createDraft({ actions, toast, onTurnBlocked }) {
     if (sortBy === 'value') list.sort((a, b) => b.valueEur - a.valueEur || a.name.localeCompare(b.name, 'tr'));
     if (sortBy === 'name') list.sort((a, b) => a.name.localeCompare(b.name, 'tr'));
     if (sortBy === 'club') list.sort((a, b) => a.clubName.localeCompare(b.clubName, 'tr') || b.valueEur - a.valueEur);
+    if (sortBy === 'age') list.sort((a, b) => (a.age ?? 99) - (b.age ?? 99) || b.valueEur - a.valueEur);
     return list;
   }
   function renderPool(reorder) {
@@ -146,24 +158,26 @@ export function createDraft({ actions, toast, onTurnBlocked }) {
     const theirs = new Set((room?.[rivalRole()]?.xi || []).filter(Boolean));
     const turnFree = myTurn();
     let visibleCount = 0;
-    const counts = { all: 0, gs: 0, fb: 0, bjk: 0, ts: 0, other: 0 };
+    const counts = { all: 0 };
+    LEAGUES.forEach(l => { counts[l.key] = 0; });
     PLAYERS.forEach(p => {
       const el = poolCards.get(p.id);
-      const okText = !q || norm(p.name).includes(q) || norm(p.clubName).includes(q);
+      const okText = !q || searchText.get(p.id).includes(q);
       const okPos = posFilter === 'all' || GROUP[roleOf(p)] === posFilter;
-      if (okText && okPos) { counts.all++; counts[p.club]++; }
-      const show = okText && okPos && (clubFilter === 'all' || p.club === clubFilter);
+      const okClub = clubFilter === 'all' || p.club === clubFilter;
+      if (okText && okPos && okClub) { counts.all++; counts[p.league]++; }
+      const show = okText && okPos && okClub && (leagueFilter === 'all' || p.league === leagueFilter);
       el.classList.toggle('hidden', !show);
       el.classList.toggle('picked', mine.has(p.id));
       el.classList.toggle('taken', theirs.has(p.id));
       el.classList.toggle('wait', !turnFree && !mine.has(p.id) && !theirs.has(p.id));
       if (show) visibleCount++;
     });
-    $('#clubChips').querySelectorAll('.chip').forEach(c => { c.querySelector('.c').textContent = counts[c.dataset.k]; });
+    $('#leagueChips').querySelectorAll('.chip').forEach(c => { c.querySelector('.c').textContent = counts[c.dataset.k] ?? 0; });
     let empty = pool.querySelector('.pool-empty');
     if (!visibleCount && !empty) { empty = document.createElement('div'); empty.className = 'pool-empty'; empty.textContent = 'No players match.'; pool.appendChild(empty); }
     else if (visibleCount && empty) empty.remove();
-    markClub(); markPos();
+    markLeague(); markPos();
   }
 
   // ---------------------------------------------------------------- pitch geometry
@@ -233,7 +247,7 @@ export function createDraft({ actions, toast, onTurnBlocked }) {
     el.dataset.id = id;
     el.innerHTML = `<span class="slotrole"></span><div class="inner"><div class="pcard">${cardHTML(p, '<span class="fit"></span>')}</div></div>`;
     styleClub(el.querySelector('.pcard'), p);
-    el.title = `${p.name} — ${p.clubName} · ${p.pos}${p.value ? ' · ' + p.value : ''}`;
+    el.title = playerTitle(p);
     layer.appendChild(el);
     pcs.set(id, el);
     fitName(el, geo.cardW);

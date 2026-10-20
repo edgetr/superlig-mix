@@ -4,7 +4,7 @@
 // Runs on the HOST's computer. It signs in with ChatGPT (OpenAI's "Sign in with ChatGPT"
 // flow for open-source apps: OAuth 2.0 + PKCE with a 127.0.0.1 loopback redirect, tokens kept
 // in a 0600 file under ~/.superlig-mix — never sent anywhere else), then watches the rooms you
-// link from the website and streams GPT-6 Luna's minute-by-minute match into them.
+// link from the website and streams GPT-6.1 Sol's minute-by-minute match into them.
 //
 //   npx github:edgetr/superlig-mix        (or: npm run host)
 //
@@ -20,7 +20,7 @@ import { spawn } from 'node:child_process';
 import { ConvexClient } from 'convex/browser';
 import { anyApi } from 'convex/server';
 
-const VERSION = '1.0.0';
+const VERSION = '1.1.0';
 const HOST = '127.0.0.1';
 const PORT = Number(process.env.PORT || 1457);
 const ORIGIN = `http://${HOST}:${PORT}`;
@@ -37,7 +37,7 @@ const SCOPES = 'openid profile email offline_access resource.invoke chatgpt.toke
 const PLAN_SCOPE = 'chatgpt.tokens.use.direct';
 const REGISTRATION_CLIENT_ID = 'dynamic_agent_client';
 const APP_NAME = 'Süper Lig Mix Host';
-const MODEL = 'gpt-6-luna';
+const MODEL = 'gpt-6.1-sol';
 const REASONING_EFFORT = 'high';
 
 const DATA_DIR = process.env.SUPERLIG_MIX_HOME || path.join(os.homedir(), '.superlig-mix');
@@ -296,34 +296,51 @@ function onRoom(link, room) {
 
 // ---------------------------------------------------------------- the match
 
-const KINDS = new Set(['meta', 'ev', 'stats', 'ratings', 'analysis', 'end']);
+const KINDS = new Set(['meta', 'flow', 'ev', 'stats', 'ratings', 'analysis', 'end']);
 
-const INSTRUCTIONS = `You are a vivid but realistic football match engine and TV commentator.
-Two friends drafted these starting XIs from players in the Turkish Süper Lig 2026/27 season. Simulate ONE 90-minute match between them, minute by minute.
+const INSTRUCTIONS = `You are a professional football match engine, tactics analyst and TV commentator.
+Two friends drafted these starting XIs (players from the Turkish Süper Lig and Europe's big five leagues, 2026/27). Simulate ONE realistic 90-minute match between them and write it as a precise match script. A game engine will turn your script into a broadcast with real positions, so locations and details must be football-accurate.
 
-Ground rules:
-- Neutral ground. There is NO home or away side and no home advantage: treat both teams exactly equally; only player quality, form, fit and tactics matter.
-- Team A and Team B are labels only. Use each team's real name in commentary.
-- Judge strength realistically from the players' quality, market value, age, positional fit (players marked OUT OF POSITION should hurt their team), formation balance and chemistry. No bench: the same XI plays 90 minutes (a red card leaves a team with 10).
-- Make it dramatic and fun but believable: momentum swings, chances, saves, the occasional card, VAR, woodwork. Typical matches have 0–5 goals.
+GROUND RULES
+- Neutral ground: no home side, no home advantage. Judge strength only on quality, form, age, positional fit (OUT OF POSITION players perform clearly worse; a non-goalkeeper in goal is a disaster), formation balance, chemistry and the tactics you choose for each side.
+- Realism first. Typical totals: 8–30 shots for both sides combined, 2–10 corners, 15–30 fouls, 0–6 goals, 0–5 yellow cards, offsides 1–6. Big chances get missed; keepers make saves; elite attackers convert more. Upsets are possible but must be earned.
+- All Laws of the Game apply: kick-off restarts after goals (the engine adds them), free kicks are taken from where the foul happened, fouls inside the penalty area are penalties, two yellows = red (then that team plays with 10), the same XI plays all 90 minutes (no substitutions), offside is judged when the ball is played.
+- Use player names EXACTLY as listed. Team A and Team B are labels; use real team names in text.
 
-Output format — JSON Lines ONLY (one compact JSON object per line, no markdown, no prose, no code fences), in this exact order:
-1) {"kind":"meta","data":{"kickoff":"A"|"B","referee":"<name>","weather":"<short>","headline":"<one-line pre-match hook>"}}
-2) Match events in chronological order, at least one for EVERY minute from 1 to 90 plus stoppage time:
-   {"kind":"ev","data":{"min":<1-90>,"add":<0 or stoppage minute>,"type":"<type>","side":"A"|"B"|null,"player":"<exact name from that side's XI or null>","assist":"<exact name or null>","zone":"left"|"center"|"right"|null,"text":"<commentary, max 140 chars>"}}
-   type is one of: kickoff, possession, chance, shot, save, block, woodwork, goal, own_goal, penalty_goal, penalty_miss, foul, yellow, second_yellow, red, corner, free_kick, offside, injury, var, half_time, second_half, full_time
-   - Minute 1 starts with type "kickoff". First-half stoppage is min 45 with add 1..N, then "half_time" (min 45). Second half starts with "second_half" at min 46. Second-half stoppage is min 90 with add 1..N, ending with "full_time" (min 90).
-   - For goal / penalty_goal / own_goal, "side" is the team that GETS the goal. For own_goal, "player" is the defender (from the other team) who put it in.
-   - Use 2–3 short events in big minutes, 1 in quiet ones. Use only player names exactly as listed.
-3) {"kind":"stats","data":{"possession":[a,b],"shots":[a,b],"on_target":[a,b],"xg":[a,b],"corners":[a,b],"fouls":[a,b],"offsides":[a,b],"yellow":[a,b],"red":[a,b],"motm":{"side":"A"|"B","player":"<name>","reason":"<short>"}}}  (all consistent with the events; possession sums to 100)
+COORDINATES (for "x","y"): always from the perspective of the team in "side", attacking towards the opponent's goal. x = 0 at their own goal line … 100 at the opponent's goal line (penalty spot ≈ 89.5, edge of the box ≈ 84, halfway = 50). y = 0 at their left touchline … 100 at their right touchline (goal centre = 50, box spans y 20–80, six-yard box y 37–63).
+
+OUTPUT — JSON Lines only (one compact JSON object per line; no markdown, no prose, no code fences), in this order:
+1) {"kind":"meta","data":{"kickoff":"A"|"B","referee":"<name>","weather":"<short>","headline":"<one-line pre-match hook>","styles":{"A":{"style":"<e.g. possession, counter-attack, high press, direct, wing play>","line":"high|mid|deep","press":"high|mid|low","width":"wide|normal|narrow","tempo":"fast|medium|slow","build":"short|mixed|direct"},"B":{...}}}}
+   Choose each team's tactics to suit its players.
+2) The match, chronologically. For each block of roughly 5–10 minutes write a flow line, then that block's key events:
+   {"kind":"flow","data":{"from":<min>,"to":<min>,"momentum":"A"|"B"|null,"possession":[a,b],"note":"<one sentence on how play is going>"}}
+   {"kind":"ev","data":{...}} with these types (only log meaningful moments, not every pass):
+   • shot — every shot. Fields: "min","add","type":"shot","side","player","assist" (exact name or null),"x","y" (where the shot is taken),
+     "outcome":"goal"|"saved"|"parried"|"tipped"|"off_target"|"blocked"|"woodwork"|"disallowed",
+     "reason" (only for disallowed: "offside"|"foul"|"handball"),
+     "body":"right"|"left"|"head" (respect each player's preferred foot),
+     "technique":"placed"|"power"|"curl"|"chip"|"volley"|"tap_in"|"long_range"|"header"|"penalty"|"free_kick",
+     "target":"bottom_left"|"bottom_right"|"top_left"|"top_right"|"middle"|"high"|"wide_left"|"wide_right" (from the shooter's view; off_target must use high/wide_*),
+     "assist_type":"through_ball"|"cross"|"cutback"|"short_pass"|"long_ball"|"corner"|"free_kick"|"penalty"|"rebound"|"solo",
+     "build_up":"possession"|"counter"|"long_ball"|"press_win"|"set_piece","xg":<0.01–0.95>,"text":"<commentary, max 140 chars>"
+   • foul — fouls that matter: every card, every penalty, and free kicks in the attacking third. "side" = the team that WINS the free kick, "player" = the fouled player, "offender" = who committed it (other team), "x","y" = where it happened (side's perspective), "card":"yellow"|"red"|null, "penalty":true|false.
+     If the free kick or penalty leads to a shot, the NEXT line is that shot with the same minute, "assist_type":"free_kick" (direct: technique "free_kick", x/y = the foul spot) or "penalty" (technique "penalty").
+   • offside — "side" = attacking team flagged, "player" = the runner, "assist" = the passer, "x","y" = where the runner was.
+   • corner — only corners that do NOT lead to a shot ("side" = team taking it, "y" ≈ 0 or 100 for the flag). A corner that leads to a shot is just the shot with "assist_type":"corner".
+   • injury — "side","player" (brief stoppage, the player continues).
+   • half_time — {"min":45,"add":<first-half stoppage minutes>,"type":"half_time","text":...}. First-half stoppage events use "min":45,"add":1..N. Second half starts at minute 46.
+   • full_time — {"min":90,"add":<second-half stoppage>,"type":"full_time","text":...}. Second-half stoppage events use "min":90,"add":1..N.
+3) {"kind":"stats","data":{"possession":[a,b],"shots":[a,b],"on_target":[a,b],"xg":[a,b],"corners":[a,b],"fouls":[a,b],"offsides":[a,b],"yellow":[a,b],"red":[a,b],"motm":{"side":"A"|"B","player":"<name>","reason":"<short>"}}} — consistent with your events.
 4) {"kind":"ratings","data":{"A":[{"player":"<name>","rating":<1.0-10.0>}, ... all 11],"B":[... all 11]}}
 5) {"kind":"analysis","data":{"side":"A","summary":"<2 sentences on how they played>","strengths":["...","...","..."],"weaknesses":["...","...","..."],"resembles":{"club":"<a real club from the Premier League, LaLiga, Serie A, Bundesliga or Ligue 1>","league":"<that league>","why":"<1 sentence on why this XI plays like that club>"}}}
 6) The same analysis object for side "B".
 7) {"kind":"end","data":{}}`;
 
 function teamBlock(label, t) {
+  const info = p => [p.club, `natural position ${p.pos}`, p.fit === 'off' ? 'OUT OF POSITION' : p.fit === 'ok' ? 'adapted position' : null,
+    p.foot ? `${p.foot}-footed` : null, p.age ? `age ${p.age}` : null, p.height ? `${p.height} cm` : null, `value ${p.value || 'unknown'}`].filter(Boolean).join(', ');
   return `Team ${label}: ${t.name} — formation ${t.formation}
-${t.players.map(p => `- ${p.role}: ${p.name} (${p.club}, natural position ${p.pos}${p.fit === 'off' ? ', OUT OF POSITION' : p.fit === 'ok' ? ', adapted position' : ''}, value ${p.value || 'unknown'})`).join('\n')}`;
+${t.players.map(p => `- ${p.role}${p.num != null ? ` #${p.num}` : ''}: ${p.name} (${info(p)})`).join('\n')}`;
 }
 
 const INFERENCE_ERRORS = {
@@ -369,10 +386,11 @@ async function runJob(link, jobId) {
     if (!item || !KINDS.has(item.kind) || typeof item.data !== 'object' || item.data === null) return;
     if (item.kind === 'ev') {
       const d = item.data;
-      if (typeof d.text === 'string') d.text = d.text.slice(0, 180);
+      if (typeof d.text === 'string') d.text = d.text.slice(0, 200);
       setPhase(`Writing minute ${d.min}${d.add ? '+' + d.add : ''}…`);
       if (d.type === 'full_time') sawFullTime = true;
     }
+    if (item.kind === 'flow') setPhase(`Writing minutes ${item.data.from}–${item.data.to}…`);
     if (item.kind === 'stats') setPhase('Full time — writing the analysis…', true);
     if (item.kind === 'end') sawEnd = true;
     queue.push(item);
@@ -381,7 +399,7 @@ async function runJob(link, jobId) {
 
   try {
     const token = await accessToken();
-    setPhase('GPT-6 Luna is thinking (high reasoning)…', true);
+    setPhase('GPT-6.1 Sol is reading both line-ups (high reasoning)…', true);
     const r = await fetch(`${API_BASE}/responses`, {
       method: 'POST',
       headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json', Accept: 'text/event-stream' },
@@ -402,7 +420,7 @@ async function runJob(link, jobId) {
     }
     const reader = r.body.getReader(), dec = new TextDecoder();
     let buf = '', text = '', failed = null, completed = false, thinkingSince = Date.now();
-    const thinkTimer = setInterval(() => { if (!text) setPhase(`GPT-6 Luna is thinking (high reasoning)… ${Math.round((Date.now() - thinkingSince) / 1000)}s`, true); }, 5000);
+    const thinkTimer = setInterval(() => { if (!text) setPhase(`GPT-6.1 Sol is planning the match (high reasoning)… ${Math.round((Date.now() - thinkingSince) / 1000)}s`, true); }, 5000);
     try {
       for (;;) {
         const { value, done } = await reader.read();
@@ -462,7 +480,7 @@ h1{margin:0 0 4px;font-size:22px}.sub{color:#8b9a92;margin:0 0 20px;font-size:13
 .msg.err{background:#2a1b1b;border-color:#4a2f2f}
 </style></head><body><div class="card">
 <h1><span class="badge">TSL</span>Süper Lig Mix — host helper</h1>
-<p class="sub">Keep this running while you host. It signs in with ChatGPT on <b>this computer</b> and lets GPT-6 Luna (high reasoning) simulate your matches on your ChatGPT plan. Your ChatGPT tokens stay in <code>~/.superlig-mix</code>.</p>
+<p class="sub">Keep this running while you host. It signs in with ChatGPT on <b>this computer</b> and lets GPT-6.1 Sol (high reasoning) simulate your matches on your ChatGPT plan. Your ChatGPT tokens stay in <code>~/.superlig-mix</code>.</p>
 <div id="msg"></div>
 <div id="acct"></div>
 <div class="row" style="display:block"><div><b>Linked games</b></div><div id="rooms" class="muted">None yet. In the game, click <b>Connect ChatGPT → Link this game</b>.</div></div>
@@ -477,7 +495,7 @@ async function load(){
   const a=document.getElementById('acct');
   if(!s.signedIn){a.innerHTML='<div class="row"><span>Not signed in</span><a class="siwc" href="/auth/start">'+LOGO+'Sign in with ChatGPT</a></div>';}
   else{a.innerHTML='<div class="row"><div><b>'+esc(s.email||'ChatGPT account')+'</b><br><span class="'+(s.planUsage?'ok':'warn')+'">'+(s.planUsage?'Using ChatGPT plan':'ChatGPT plan usage not granted')+'</span> · <a href="https://chatgpt.com/settings/usage" target="_blank" rel="noopener">Manage usage</a></div><button class="btn" id="out">Sign out</button></div>'
-    +'<div class="row"><span class="muted">Model</span><span>GPT-6 Luna · '+esc(s.effort)+' reasoning</span></div>'
+    +'<div class="row"><span class="muted">Model</span><span>GPT-6.1 Sol · '+esc(s.effort)+' reasoning</span></div>'
     +(s.planUsage&&!s.noticeSeen?'<div class="msg"><b>You\\'re using your ChatGPT plan</b><br>Matches simulated by this helper count toward your ChatGPT plan usage. <button class="btn" id="got">Got it</button></div>':'')
     +(s.planUsage?'':'<div class="row"><span class="warn">Plan usage is needed to simulate matches.</span><a class="siwc" href="/auth/start">'+LOGO+'Sign in with ChatGPT</a></div>');
     document.getElementById('out').onclick=async()=>{await post('/api/signout');load()};

@@ -43,7 +43,7 @@ export default defineSchema({
     updatedAt: v.number(),
   }).index('by_code', ['code']),
 
-  // Match items streamed from GPT-6 Luna by the host helper (append-only).
+  // Match items streamed from GPT-6.1 Sol by the host helper (append-only).
   events: defineTable({
     roomId: v.id('rooms'),
     jobId: v.string(),

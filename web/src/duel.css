@@ -203,3 +203,23 @@ a.btn { color: var(--text); text-decoration: none; display: inline-block; }
   .lu-vs { font-size: 34px; }
   .big-code { font-size: 44px; }
 }
+
+/* ---------- big pool (600+ players): leagues, club select, shirt numbers */
+.pos-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+#clubSelect { flex: 0 1 170px; min-width: 0; background: #0b110e; border: 1px solid #2a3731; border-radius: 8px; padding: 5px 8px; outline: none; font-size: 12.5px; color: var(--text); }
+#clubSelect:focus { border-color: #4a6157; }
+.pool .pcard { content-visibility: auto; contain-intrinsic-size: auto 180px; }
+.pcard .role .num { font-style: normal; font-weight: 700; opacity: .75; margin-left: 4px; }
+#leagueChips .chip .c { margin-left: 6px; }
+
+/* Moments gallery (analysis images) */
+.moment { margin-bottom: 12px; border-radius: 12px; overflow: hidden; background: #121a16; border: 1px solid #26332d; border-top: 3px solid var(--c); }
+.moment .mthumb { aspect-ratio: 16 / 9; background: #0b100d; display: grid; place-items: center; }
+.moment .mthumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.moment .mthumb span { color: var(--muted); font-size: 12.5px; }
+.moment .mmeta { padding: 8px 10px 4px; font-size: 13px; }
+.moment .mmeta b { color: #ffd34d; margin-right: 4px; }
+.moment .mact { display: flex; gap: 6px; padding: 4px 10px 10px; }
+.moment.locked { opacity: .7; }
+.btn.small { padding: 5px 9px; font-size: 12px; }
+.feed-item.flow { color: var(--muted); font-style: italic; }

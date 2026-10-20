@@ -1,5 +1,5 @@
 // Functions used by the host helper (companion/host.mjs), which runs on the host's own
-// computer, signs in with ChatGPT and streams GPT-6 Luna's match into the room.
+// computer, signs in with ChatGPT and streams GPT-6.1 Sol's match into the room.
 // Every call is authenticated with the room's host key.
 import { ConvexError, v } from 'convex/values';
 import { mutation, query } from './_generated/server';
@@ -22,7 +22,7 @@ function team(side) {
     name: side.teamName, formation: side.formation, color: side.color,
     players: side.xi.map((id, i) => {
       const p = byId.get(id);
-      return { id, name: p.name, role: f[i][0], pos: p.pos, club: p.clubName, value: p.value, fit: fitOf(p, f[i][0]) };
+      return { id, name: p.name, role: f[i][0], pos: p.pos, club: p.clubName, value: p.value, fit: fitOf(p, f[i][0]), num: p.num ?? null, foot: p.foot ?? null, age: p.age ?? null, height: p.height ?? null };
     }),
   };
 }
@@ -53,7 +53,7 @@ export const claim = mutation({
   handler: async (ctx, { roomId, key, jobId }) => {
     const room = await hostRoom(ctx, roomId, key);
     if (room.sim.jobId !== jobId || room.sim.state !== 'queued') return null;
-    await ctx.db.patch(roomId, { sim: { ...room.sim, state: 'running', phase: 'GPT-6 Luna is reading both line-ups…', startedAt: Date.now() } });
+    await ctx.db.patch(roomId, { sim: { ...room.sim, state: 'running', phase: 'GPT-6.1 Sol is reading both line-ups…', startedAt: Date.now() } });
     return { jobId, kickoff: room.sim.kickoff || 'A', teams: { A: team(room.host), B: team(room.guest) } };
   },
 });

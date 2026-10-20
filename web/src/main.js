@@ -140,7 +140,7 @@ function onRoom(r) {
   showScreen(screen);
   if (screen === 'lobby') renderLobby(prev);
   if (screen === 'draft') { draft.update(r, sess.role); renderHeader(prev); }
-  if (screen === 'lineups') renderLineups(prev);
+  if (screen === 'lineups') { renderLineups(prev); matchScreen.prepare(r); }
   if (screen === 'match') matchScreen.update(r);
   if (!$('#modal').hidden && modalKind === 'ai') renderAiModal();
   if (prev && prev.guest == null && r.guest && sess.role === 'host') toast(`${r.guest.name} joined!`, 'Pick your kit, then start the draft.');
@@ -182,8 +182,8 @@ function renderLobby(prev) {
     .map(([s, l]) => `<button data-s="${s}" class="${r.pickTimer === s ? 'on' : ''}" ${sess.role !== 'host' ? 'disabled' : ''}>${l}</button>`).join('');
 
   $('#aiRow').innerHTML = sess.role === 'host'
-    ? `<span>Match simulation · GPT-6 Luna on your ChatGPT plan</span>${aiChipHTML(r)}`
-    : `<span>Match simulation · GPT-6 Luna (host's ChatGPT)</span><span class="${helperOk(r) ? 'ok' : 'muted'}" style="font-weight:700;color:${helperOk(r) ? 'var(--good)' : 'var(--muted)'}">${helperOk(r) ? 'Connected' : 'Host will connect it'}</span>`;
+    ? `<span>Match simulation · GPT-6.1 Sol on your ChatGPT plan</span>${aiChipHTML(r)}`
+    : `<span>Match simulation · GPT-6.1 Sol (host's ChatGPT)</span><span class="${helperOk(r) ? 'ok' : 'muted'}" style="font-weight:700;color:${helperOk(r) ? 'var(--good)' : 'var(--muted)'}">${helperOk(r) ? 'Connected' : 'Host will connect it'}</span>`;
   $('#aiRow').querySelector('.ai-chip')?.addEventListener('click', openAiModal);
 
   const actionsEl = $('#lobbyActions');
@@ -209,7 +209,7 @@ $('#leaveBtn').addEventListener('click', () => { if (confirm('Leave this game? Y
 function aiChipHTML(r) {
   const c = r.companion, online = c && isOnline(c.lastSeen);
   const [cls, st] = !online ? ['off', 'Connect ChatGPT'] : !c.signedIn ? ['warn', 'Sign in needed'] : !c.planUsage ? ['warn', 'Plan usage off'] : c.busy ? ['ok', 'Simulating…'] : ['ok', 'ChatGPT connected'];
-  return `<button class="ai-chip ${cls}" title="GPT-6 Luna via the host's ChatGPT plan"><img src="/chatgpt-logo-white.svg" alt=""><span class="st">${st}</span></button>`;
+  return `<button class="ai-chip ${cls}" title="GPT-6.1 Sol via the host's ChatGPT plan"><img src="/chatgpt-logo-white.svg" alt=""><span class="st">${st}</span></button>`;
 }
 const teamNameEl = $('#teamName');
 teamNameEl.addEventListener('change', () => run(call(api.rooms.updateSide, { teamName: teamNameEl.value }), 'Could not rename'));
@@ -235,7 +235,7 @@ function renderHeader() {
     label = r.guestReady ? 'Ready ✓' : 'Ready'; sub = r.guestReady ? 'click to undo' : 'lock in your XI'; disabled = n !== 11; kind = 'ready';
   } else {
     label = 'Simulate'; kind = 'simulate';
-    sub = !r.guestReady ? `waiting for ${riv?.name || 'rival'}` : !helperOk(r) ? 'connect ChatGPT first' : 'GPT-6 Luna · High';
+    sub = !r.guestReady ? `waiting for ${riv?.name || 'rival'}` : !helperOk(r) ? 'connect ChatGPT first' : 'GPT-6.1 Sol · High';
     disabled = false;
   }
   btn.dataset.kind = kind;
@@ -299,7 +299,7 @@ function renderAiModal() {
   const linkUrl = `${HELPER_ORIGIN}/link#${new URLSearchParams({ convex: CONVEX_URL, room: sess.roomId, key: sess.key, code: room.code })}`;
   $('#modalBody').innerHTML = `
     <h2 style="margin:0 0 4px">Connect ChatGPT</h2>
-    <p class="muted" style="margin:0;font-size:13.5px">GPT-6 Luna simulates the match on <b>your</b> ChatGPT plan. OpenAI's Sign in with ChatGPT for open-source apps runs on your own computer, so a tiny open-source helper does the sign-in and the model calls — your ChatGPT tokens never leave your machine.</p>
+    <p class="muted" style="margin:0;font-size:13.5px">GPT-6.1 Sol simulates the match on <b>your</b> ChatGPT plan. OpenAI's Sign in with ChatGPT for open-source apps runs on your own computer, so a tiny open-source helper does the sign-in and the model calls — your ChatGPT tokens never leave your machine.</p>
     <div class="steps">
       <div class="step ${online ? 'done' : ''}"><span class="n">${online ? '✓' : 1}</span><div>
         <b>Start the host helper</b>
@@ -317,7 +317,7 @@ function renderAiModal() {
         <p>${!online ? 'In the helper window.' : !c.signedIn ? 'Click “Sign in with ChatGPT” in the helper window.' : !c.planUsage ? 'Signed in, but plan usage was not granted — sign in again in the helper and allow it.' : `Signed in${c.email ? ' as <b>' + esc(c.email) + '</b>' : ''} · Using ChatGPT plan · <a href="https://chatgpt.com/settings/usage" target="_blank" rel="noopener">Manage usage</a>`}</p>
       </div></div>
     </div>
-    ${helperOk(room) ? '<p style="margin:10px 0 0;color:var(--good);font-weight:700">All set — GPT-6 Luna (high reasoning) is ready.</p>' : ''}`;
+    ${helperOk(room) ? '<p style="margin:10px 0 0;color:var(--good);font-weight:700">All set — GPT-6.1 Sol (high reasoning) is ready.</p>' : ''}`;
   $('#copyCmd').addEventListener('click', () => copy(HELPER_CMD, 'Command'));
 }
 
@@ -350,7 +350,7 @@ function renderLineups(prev) {
     : s.state === 'done' ? 'Match simulated — ready when you are.'
     : `<span class="spin" style="display:inline-block;vertical-align:-3px;margin-right:6px"></span>${esc(s.phase || 'Preparing…')}`;
   $('#luFoot').innerHTML = sess.role === 'host'
-    ? `${s.state === 'error' ? '<button class="btn" id="retrySim">Retry simulation</button>' : ''}<button class="btn primary big" id="continueBtn">Continue ▶<small>${s.state === 'done' ? 'watch the match' : 'starts while GPT-6 Luna writes it'}</small></button>`
+    ? `${s.state === 'error' ? '<button class="btn" id="retrySim">Retry simulation</button>' : ''}<button class="btn primary big" id="continueBtn">Continue ▶<small>${s.state === 'done' ? 'watch the match' : 'starts while GPT-6.1 Sol writes it'}</small></button>`
     : `<p class="muted">Waiting for ${esc(r.host.name)} to continue…</p>`;
   $('#continueBtn')?.addEventListener('click', () => run(call(api.rooms.continueMatch), 'Could not continue'));
   $('#retrySim')?.addEventListener('click', () => run(call(api.rooms.retrySim), 'Could not retry'));

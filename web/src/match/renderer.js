@@ -1,1600 +1,1347 @@
-// Deterministic broadcast-style match renderer.
-// Builds an append-only timeline of scenes from streamed match items and draws any frame
-// at time t (ms) onto a 1280×720 2D canvas. Same t => same pixels: no clocks, no Math.random.
-// All easing / springs / interpolation come from Motion's pure utilities.
+// Match "broadcast": turns GPT's match script into a deterministic highlight show rendered on a
+// 1280×720 canvas. Every scripted moment is played out by the football engine (../sim/core.js)
+// and filmed with TV-style cameras (../sim/draw.js): live action, slow-motion replays from
+// another angle, and freeze-frame analysis images showing how it happened.
+//
+// API (unchanged for the app): createMatch({ teams }) → { setItems, duration, complete, render,
+// infoAt, preload, score, timeline, moments }.
+import { interpolate, clamp as mclamp, easeOut, easeInOut, backOut, circOut } from 'motion';
+import * as C from '../sim/core.js';
+import * as D from '../sim/draw.js';
 
-import { FORMATIONS, GROUP } from '../../../shared/game.js';
-import { mix, clamp, easeInOut, easeOut, easeIn, backOut, circOut, cubicBezier, spring } from 'motion';
+export const W = D.W, H = D.H;
+const FONT = D.FONT;
+const HZ = C.HZ;
+const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
+const lerp = (a, b, t) => a + (b - a) * t;
 
-export const W = 1280, H = 720;
-
-// ------------------------------------------------------------------ geometry
-const FONT = 'system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif';
-const FH = 600, FW = Math.round(FH * 105 / 68);
-const FL = Math.round((W - FW) / 2), FT = 70, FR = FL + FW, FB = FT + FH;
-const CX = FL + FW / 2, CY = FT + FH / 2;
-const GH = (7.32 / 68) * FH / 2;          // half goal width
-const GD = 16;                            // goal depth
-const BOXD = (16.5 / 105) * FW, BOXH = (40.32 / 68) * FH / 2;
-const SIXD = (5.5 / 105) * FW, SIXH = (18.32 / 68) * FH / 2;
-const SPOT = (11 / 105) * FW;
-const CIRC = (9.15 / 105) * FW;
-const TUNNEL = [CX, FT - 46];
-
-// ------------------------------------------------------------------ math helpers (Motion-based)
-const c01 = v => clamp(0, 1, v);
-const seg = (t, a, b) => (b <= a ? (t >= b ? 1 : 0) : c01((t - a) / (b - a)));
-const smooth = cubicBezier(0.22, 1, 0.36, 1);
-const swift = cubicBezier(0.4, 0, 0.2, 1);
-
-function springLUT(stiffness, damping, mass = 1, ms = 2400) {
-  const gen = spring({ keyframes: [0, 1], stiffness, damping, mass });
-  const n = Math.ceil(ms / 4) + 1, lut = new Float32Array(n);
-  for (let i = 0; i < n; i++) lut[i] = gen.next(i * 4).value;
-  lut[n - 1] = 1;
-  return lut;
+// ------------------------------------------------------------------ text helpers
+const mctx = (() => { const c = document.createElement('canvas'); return c.getContext('2d'); })();
+const fitMemo = new Map(), wrapMemo = new Map();
+function fit(text, weight, max, maxW, min = 10, italic = false) {
+  const key = `${text}|${weight}|${max}|${maxW}|${min}|${italic}`;
+  let v = fitMemo.get(key);
+  if (v === undefined) { v = fitRaw(text, weight, max, maxW, min, italic); if (fitMemo.size > 4000) fitMemo.clear(); fitMemo.set(key, v); }
+  return v;
 }
-const SPR = {
-  pop: springLUT(420, 15),
-  soft: springLUT(220, 24),
-  bouncy: springLUT(520, 10),
-  snappy: springLUT(700, 36),
-};
-function spr(lut, ms) {
-  if (ms <= 0) return 0;
-  const f = ms / 4, i = f | 0;
-  if (i >= lut.length - 1) return lut[lut.length - 1];
-  return lut[i] + (lut[i + 1] - lut[i]) * (f - i);
+function fitRaw(text, weight, max, maxW, min = 10, italic = false) {
+  for (let s = max; s > min; s -= 1) { mctx.font = `${italic ? 'italic ' : ''}${weight} ${s}px ${FONT}`; if (mctx.measureText(text).width <= maxW) return s; }
+  return min;
 }
-
-function mulberry32(a) {
-  return function () {
-    a |= 0; a = (a + 0x6d2b79f5) | 0;
-    let t = Math.imul(a ^ (a >>> 15), 1 | a);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
+function wrap(text, weight, size, maxW, maxLines = 3) {
+  const key = `${text}|${weight}|${size}|${maxW}|${maxLines}`;
+  let v = wrapMemo.get(key);
+  if (!v) { v = wrapRaw(text, weight, size, maxW, maxLines); if (wrapMemo.size > 2000) wrapMemo.clear(); wrapMemo.set(key, v); }
+  return v;
 }
-
-function makeCanvas(w, h) {
-  if (typeof document !== 'undefined') { const c = document.createElement('canvas'); c.width = w; c.height = h; return c; }
-  return new OffscreenCanvas(w, h);
-}
-
-// ------------------------------------------------------------------ colour + text helpers
-function hexRgb(hex) {
-  let h = String(hex || '#888888').replace('#', '');
-  if (h.length === 3) h = h.split('').map(c => c + c).join('');
-  const n = parseInt(h.slice(0, 6), 16);
-  return Number.isFinite(n) ? [(n >> 16) & 255, (n >> 8) & 255, n & 255] : [136, 136, 136];
-}
-const lum = ([r, g, b]) => (0.299 * r + 0.587 * g + 0.114 * b) / 255;
-const rgba = ([r, g, b], a) => `rgba(${r},${g},${b},${a})`;
-const shade = ([r, g, b], k) => [Math.round(r * k), Math.round(g * k), Math.round(b * k)];
-
-const font = (weight, size, italic = false) => `${italic ? 'italic ' : ''}${weight} ${Math.round(size * 10) / 10}px ${FONT}`;
-let measureCtx = null;
-const wCache = new Map();
-function textW(f, text) {
-  const k = f + '\u0000' + text;
-  let w = wCache.get(k);
-  if (w === undefined) {
-    measureCtx ||= makeCanvas(8, 8).getContext('2d');
-    measureCtx.font = f; w = measureCtx.measureText(text).width; wCache.set(k, w);
+function wrapRaw(text, weight, size, maxW, maxLines = 3) {
+  mctx.font = `${weight} ${size}px ${FONT}`;
+  const words = String(text || '').split(/\s+/); const lines = []; let line = '';
+  for (const w of words) {
+    const t = line ? line + ' ' + w : w;
+    if (mctx.measureText(t).width > maxW && line) { lines.push(line); line = w; if (lines.length === maxLines) break; } else line = t;
   }
-  return w;
+  if (lines.length < maxLines && line) lines.push(line);
+  if (lines.length === maxLines && words.join(' ') !== lines.join(' ')) lines[maxLines - 1] = lines[maxLines - 1].replace(/\s*\S*$/, '') + '…';
+  return lines;
 }
-const fitCache = new Map();
-function fitSize(text, weight, maxSize, maxW, minSize = 9, italic = false) {
-  const k = `${text}|${weight}|${maxSize}|${maxW}|${italic}`;
-  let s = fitCache.get(k);
-  if (s === undefined) {
-    s = maxSize;
-    while (s > minSize && textW(font(weight, s, italic), text) > maxW) s -= 1;
-    fitCache.set(k, s);
-  }
-  return s;
-}
-const wrapCache = new Map();
-// Wraps text into at most maxLines lines of width maxW, shrinking the font if needed.
-function wrap(text, weight, maxSize, maxW, maxLines, minSize = 11) {
-  text = String(text ?? '');
-  const k = `${text}|${weight}|${maxSize}|${maxW}|${maxLines}`;
-  let r = wrapCache.get(k);
-  if (r) return r;
-  const words = text.split(/\s+/).filter(Boolean);
-  for (let s = maxSize; s >= minSize; s -= 1) {
-    const f = font(weight, s);
-    const lines = []; let line = ''; let ok = true;
-    for (const w of words) {
-      if (textW(f, w) > maxW) { ok = false; break; }
-      const test = line ? line + ' ' + w : w;
-      if (line && textW(f, test) > maxW) { lines.push(line); line = w; } else line = test;
-    }
-    if (line) lines.push(line);
-    if (ok && lines.length <= maxLines) { r = { size: s, lines }; break; }
-  }
-  if (!r) {
-    // Last resort: hard truncate at the minimum size.
-    const f = font(weight, minSize);
-    const lines = []; let line = '';
-    for (const w of words) {
-      const test = line ? line + ' ' + w : w;
-      if (textW(f, test) > maxW && line) { lines.push(line); line = w; if (lines.length === maxLines) break; } else line = test;
-    }
-    if (lines.length < maxLines && line) lines.push(line);
-    let last = lines[lines.length - 1] || '';
-    while (last && textW(f, last + '…') > maxW) last = last.slice(0, -1);
-    if (lines.length) lines[lines.length - 1] = last + (lines.join(' ').length < text.length ? '…' : '');
-    r = { size: minSize, lines };
-  }
-  wrapCache.set(k, r);
-  return r;
-}
+const surname = n => { const p = String(n || '').trim().split(/\s+/); return p.length > 1 ? p.slice(-1)[0] : p[0] || ''; };
+const short3 = n => String(n || '').replace(/[^\p{L}\p{N}]/gu, '').slice(0, 3).toUpperCase();
+function hexRgb(h) { const n = parseInt(String(h).replace('#', '').padEnd(6, '0').slice(0, 6), 16); return [(n >> 16) & 255, (n >> 8) & 255, n & 255]; }
+const lum = h => { const [r, g, b] = hexRgb(h); return (0.299 * r + 0.587 * g + 0.114 * b) / 255; };
+const rgba = (h, a) => { const [r, g, b] = hexRgb(h); return `rgba(${r},${g},${b},${a})`; };
+const colorDist = (a, b) => { const x = hexRgb(a), y = hexRgb(b); return Math.hypot(x[0] - y[0], x[1] - y[1], x[2] - y[2]); };
+const ord = n => { const s = ['th', 'st', 'nd', 'rd'], v = n % 100; return n + (s[(v - 20) % 10] || s[v] || s[0]); };
 
-function roundRect(ctx, x, y, w, h, r) {
-  r = Math.min(r, w / 2, h / 2);
-  ctx.beginPath();
-  ctx.moveTo(x + r, y);
-  ctx.arcTo(x + w, y, x + w, y + h, r);
-  ctx.arcTo(x + w, y + h, x, y + h, r);
-  ctx.arcTo(x, y + h, x, y, r);
-  ctx.arcTo(x, y, x + w, y, r);
-  ctx.closePath();
+// ------------------------------------------------------------------ event normalisation
+const GOAL_OUT = new Set(['goal']);
+function normEv(d) {
+  const e = { ...d };
+  const t = e.type;
+  if (t === 'goal') return { ...e, type: 'shot', outcome: 'goal' };
+  if (t === 'penalty_goal') return { ...e, type: 'shot', outcome: 'goal', technique: 'penalty' };
+  if (t === 'penalty_miss') return { ...e, type: 'shot', outcome: e.outcome || 'saved', technique: 'penalty' };
+  if (t === 'save') return { ...e, type: 'shot', outcome: e.outcome || 'saved' };
+  if (t === 'woodwork') return { ...e, type: 'shot', outcome: 'woodwork' };
+  if (t === 'block') return { ...e, type: 'shot', outcome: 'blocked' };
+  if (t === 'chance') return { ...e, type: 'shot', outcome: e.outcome || 'off_target' };
+  if (t === 'own_goal') return { ...e, type: 'shot', outcome: 'goal', ownGoal: true, og: e.player, player: e.assist || null, assist_type: e.assist_type || 'cross' };
+  if (t === 'yellow' || t === 'red' || t === 'second_yellow') return { ...e, type: 'foul', card: t, offender: e.player, player: e.fouled || null, side: e.side === 'A' ? 'B' : e.side === 'B' ? 'A' : e.side };
+  return e;
 }
+const minuteStr = (min, add) => (add ? `${min}+${add}'` : `${min}'`);
 
-const norm = s => String(s || '').toLocaleLowerCase('tr').replace(/ı/g, 'i').normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/[^a-z0-9 ]/g, ' ').replace(/\s+/g, ' ').trim();
-function surname(name) {
-  const parts = String(name || '').trim().split(/\s+/);
-  if (parts.length === 1) return parts[0];
-  const last = parts[parts.length - 1];
-  return last.length <= 2 ? parts.slice(-2).join(' ') : last;
-}
-function shortName(name) {
-  const words = String(name || 'Team').trim().split(/\s+/).filter(Boolean);
-  const up = s => s.toLocaleUpperCase('tr');
-  if (words.length >= 2) return up(words.slice(0, 3).map(w => w[0]).join(''));
-  return up(words[0].slice(0, 3));
-}
-function initials(name) {
-  const p = String(name || '?').trim().split(/\s+/);
-  return (p[0][0] + (p.length > 1 ? p[p.length - 1][0] : '')).toLocaleUpperCase('tr');
-}
-
-// ------------------------------------------------------------------ static pitch layer
-const PITCH_SCALE = 1.5;
-let PITCH = null;
-function pitchLayer() {
-  if (PITCH) return PITCH;
-  const c = makeCanvas(W * PITCH_SCALE, H * PITCH_SCALE);
-  const g = c.getContext('2d');
-  g.scale(PITCH_SCALE, PITCH_SCALE);
-  // grass with mowing stripes aligned to the field
-  g.fillStyle = '#256f3a'; g.fillRect(0, 0, W, H);
-  const stripes = 14, sw = FW / stripes;
-  for (let i = -3; i < stripes + 3; i++) {
-    g.fillStyle = i % 2 === 0 ? '#2f8a47' : '#2a7e41';
-    g.fillRect(FL + i * sw, 0, sw + 0.5, H);
-  }
-  // subtle surround darkening
-  g.fillStyle = 'rgba(0,0,0,0.16)';
-  g.fillRect(0, 0, W, FT - 26); g.fillRect(0, FB + 26, W, H - FB - 26);
-  g.fillRect(0, 0, FL - 30, H); g.fillRect(FR + 30, 0, W - FR - 30, H);
-  // lines
-  g.strokeStyle = 'rgba(240,250,243,0.9)'; g.lineWidth = 2.2; g.lineJoin = 'round';
-  g.strokeRect(FL, FT, FW, FH);
-  g.beginPath(); g.moveTo(CX, FT); g.lineTo(CX, FB); g.stroke();
-  g.beginPath(); g.arc(CX, CY, CIRC, 0, Math.PI * 2); g.stroke();
-  for (const [gx, dir] of [[FL, 1], [FR, -1]]) {
-    g.strokeRect(dir > 0 ? gx : gx - BOXD, CY - BOXH, BOXD, BOXH * 2);
-    g.strokeRect(dir > 0 ? gx : gx - SIXD, CY - SIXH, SIXD, SIXH * 2);
-    const sx = gx + dir * SPOT;
-    g.beginPath(); g.arc(sx, CY, CIRC, dir > 0 ? -0.927 : Math.PI - 0.927, dir > 0 ? 0.927 : Math.PI + 0.927); g.stroke();
-    g.fillStyle = 'rgba(240,250,243,0.95)';
-    g.beginPath(); g.arc(sx, CY, 2.6, 0, Math.PI * 2); g.fill();
-    // goal + net
-    const gx0 = dir > 0 ? gx - GD : gx;
-    g.fillStyle = 'rgba(255,255,255,0.10)'; g.fillRect(gx0, CY - GH, GD, GH * 2);
-    g.strokeStyle = 'rgba(255,255,255,0.35)'; g.lineWidth = 0.8;
-    for (let y = CY - GH; y <= CY + GH + 0.1; y += 6) { g.beginPath(); g.moveTo(gx0, y); g.lineTo(gx0 + GD, y); g.stroke(); }
-    for (let x = gx0; x <= gx0 + GD + 0.1; x += 5) { g.beginPath(); g.moveTo(x, CY - GH); g.lineTo(x, CY + GH); g.stroke(); }
-    g.strokeStyle = '#ffffff'; g.lineWidth = 3;
-    g.beginPath(); g.moveTo(gx, CY - GH); g.lineTo(gx - dir * GD, CY - GH); g.lineTo(gx - dir * GD, CY + GH); g.lineTo(gx, CY + GH); g.stroke();
-    g.strokeStyle = 'rgba(240,250,243,0.9)'; g.lineWidth = 2.2;
-  }
-  g.fillStyle = 'rgba(240,250,243,0.95)';
-  g.beginPath(); g.arc(CX, CY, 3, 0, Math.PI * 2); g.fill();
-  for (const [x, y, a0] of [[FL, FT, 0], [FR, FT, Math.PI / 2], [FR, FB, Math.PI], [FL, FB, -Math.PI / 2]]) {
-    g.beginPath(); g.arc(x, y, 7, a0, a0 + Math.PI / 2); g.stroke();
-  }
-  // floodlight vignette
-  const vg = g.createRadialGradient(CX, CY, 120, CX, CY, 760);
-  vg.addColorStop(0, 'rgba(255,255,255,0.07)');
-  vg.addColorStop(0.55, 'rgba(0,0,0,0)');
-  vg.addColorStop(1, 'rgba(0,0,0,0.42)');
-  g.fillStyle = vg; g.fillRect(0, 0, W, H);
-  PITCH = c;
-  return c;
-}
-
-// Pre-built gradients/overlays that never change.
-const DIM_GRADS = new WeakMap();
-function dimGrad(ctx) {
-  let g = DIM_GRADS.get(ctx);
-  if (!g) {
-    g = ctx.createLinearGradient(0, 0, 0, H);
-    g.addColorStop(0, 'rgba(4,8,6,0.92)');
-    g.addColorStop(0.5, 'rgba(4,8,6,0.80)');
-    g.addColorStop(1, 'rgba(4,8,6,0.94)');
-    DIM_GRADS.set(ctx, g);
-  }
-  return g;
-}
-
-// ------------------------------------------------------------------ event typing
-const MINOR = new Set(['possession', 'foul', 'kickoff', 'commentary']);
-const ACTION = new Set(['chance', 'shot', 'save', 'block', 'woodwork', 'corner', 'free_kick']);
-const GOALS = new Set(['goal', 'penalty_goal', 'own_goal']);
-const CARDS = new Set(['yellow', 'second_yellow', 'red']);
-const KNOWN = new Set([...MINOR, ...ACTION, ...GOALS, ...CARDS, 'penalty_miss', 'offside', 'injury', 'var', 'half_time', 'second_half', 'full_time']);
-
-function outcomeFor(type, text) {
-  const s = norm(text);
-  if (type === 'save') return 'save';
-  if (type === 'block') return 'block';
-  if (type === 'woodwork') return 'post';
-  if (/\b(post|crossbar|bar|woodwork|upright)\b/.test(s)) return 'post';
-  if (/\b(save|saves|saved|keeper|parr|tipped|denied|stop|claims|gathers|catches)/.test(s)) return 'save';
-  if (/\bblock/.test(s)) return 'block';
-  if (/\bover\b/.test(s)) return 'over';
-  return 'wide';
-}
-
-// ------------------------------------------------------------------ public factory
+// ------------------------------------------------------------------ main
 export function createMatch({ teams }) {
-  // ---------------- teams
-  const T = { A: prepTeam(teams?.A || {}, 'A'), B: prepTeam(teams?.B || {}, 'B') };
-  const other = s => (s === 'A' ? 'B' : 'A');
-  const dirOf = s => (s === 'A' ? 1 : -1);
-  const goalX = s => (s === 'A' ? FR : FL); // goal the side attacks
+  const TEAMS = teams;
+  let items = [];
+  let built = { n: 0, scenes: [], tl: [], moments: [], state: null };
+  let complete = false;
+  let meta = null, stats = null, ratings = null, analysis = { A: null, B: null };
+  const photos = new Map();   // player id → HTMLImageElement
+  const looks = new Map();    // player id → { skin, hair }
+  let M0 = C.makeMatch(TEAMS, null);
+  const kits = makeKits(TEAMS);
 
-  function prepTeam(team, side) {
-    const formation = FORMATIONS[team.formation] ? team.formation : '4-3-3';
-    const f = FORMATIONS[formation];
-    const color = hexRgb(team.color || (side === 'A' ? '#e3262f' : '#2563eb'));
-    const light = lum(color) > 0.62;
-    const players = [];
-    for (let i = 0; i < 11; i++) {
-      const src = (team.players || [])[i] || {};
-      const [role, fx, fy] = f[i];
-      const reach = (100 - fy) / 100 * 0.5 * FW * 0.96;
-      const bx = side === 'A' ? FL + 4 + reach : FR - 4 - reach;
-      const by = side === 'A' ? FT + (fx / 100) * FH : FT + (1 - fx / 100) * FH;
-      const grp = GROUP[src.role || role] || GROUP[role] || 'MID';
-      players.push({
-        i, side, name: src.name || `${side === 'A' ? 'Home' : 'Away'} ${i + 1}`, short: surname(src.name || `#${i + 1}`),
-        role: src.role || role, img: src.img || '', bx, by,
-        k: i === 0 || role === 'GK' ? 0.035 : grp === 'DEF' ? 0.2 : grp === 'MID' ? 0.26 : 0.33,
-        sprite: null, photo: null,
-      });
+  // Engine runs in a Web Worker (falls back to the main thread if workers aren't available).
+  let worker = null, reqId = 0;
+  const pending = new Map();
+  function getWorker() {
+    if (worker === null) {
+      try {
+        worker = new Worker(new URL('../sim/worker.js', import.meta.url), { type: 'module' });
+        worker.onmessage = ({ data }) => {
+          const p = pending.get(data.id); if (!p) return;
+          pending.delete(data.id);
+          if (data.error) p.reject(new Error(data.error)); else p.resolve(data.clip);
+        };
+        worker.onerror = () => { for (const p of pending.values()) p.reject(new Error('worker failed')); pending.clear(); worker = false; };
+        worker.postMessage({ type: 'init', teams: TEAMS, styles: meta?.styles || null });
+      } catch { worker = false; }
     }
-    const t = {
-      side, name: String(team.name || (side === 'A' ? 'Home' : 'Away')), formation, color, light,
-      css: `rgb(${color.join(',')})`, dark: `rgb(${shade(color, 0.55).join(',')})`,
-      ink: light ? '#0b1410' : '#ffffff', short: shortName(team.name || side), players, lookup: new Map(),
-    };
-    players.forEach(p => {
-      t.lookup.set(norm(p.name), p.i);
-      const sn = norm(p.short); if (sn && !t.lookup.has('~' + sn)) t.lookup.set('~' + sn, p.i);
-    });
-    players.forEach(p => { p.sprite = dotSprite(t, p); p.photo = initialsSprite(t, p); });
-    return t;
+    return worker;
+  }
+  function build(half, ev, ctx) {
+    const w = getWorker();
+    const local = () => C.buildMoment(C.withHalf(M0, half), ev, ctx);
+    if (!w) return Promise.resolve().then(local);
+    return new Promise((resolve, reject) => {
+      const id = ++reqId;
+      pending.set(id, { resolve, reject });
+      w.postMessage({ type: 'build', id, half, ev, ctx: { ...ctx, sent: [...ctx.sent] } });
+    }).catch(() => local());
+  }
+  // Items are processed strictly in order (each moment depends on the match state before it).
+  let queue = [], pumping = false, waiters = [];
+  async function pump() {
+    if (pumping) return;
+    pumping = true;
+    while (queue.length) {
+      const [it, idx, gen] = queue.shift();
+      if (gen !== built.gen) continue;
+      try { await addItem(it, idx, gen); } catch (e) { console.warn('match item failed', e); }
+    }
+    pumping = false;
+    scheduleWarm();
+    const w = waiters; waiters = []; w.forEach(r => r());
+  }
+  const ready = () => (pumping || queue.length ? new Promise(r => waiters.push(r)) : Promise.resolve());
+
+  // ---------------------------------------------------------------- scene building (append-only)
+  function initState() {
+    return { t: 0, half: 1, score: [0, 0], sent: new Set(), yellows: new Map(), setup: null, lastMin: 0, lastRendered: 0, goals: [], cards: [],
+      ev: { shots: [0, 0], onT: [0, 0], corners: [0, 0], fouls: [0, 0], yellow: [0, 0], red: [0, 0], offsides: [0, 0] }, htDone: false, ftStart: null, kickedOff: false, outro: false };
+  }
+  const push = (sc) => { sc.start = built.state.t; built.scenes.push(sc); built.state.t += sc.dur; return sc; };
+
+  function setItems(list) {
+    items = list || [];
+    // Meta (team styles) comes first; if it shows up late, rebuild from scratch.
+    const m = items.find(i => i.kind === 'meta')?.data || null;
+    if (!built.state || (m && !meta)) {
+      meta = m; rebuild(); queue = [];
+      if (worker) worker.postMessage({ type: 'init', teams: TEAMS, styles: meta?.styles || null });
+    }
+    for (let i = built.n; i < items.length; i++) queue.push([items[i], i, built.gen]);
+    built.n = items.length;
+    pump();
+  }
+  function rebuild() {
+    M0 = C.makeMatch(TEAMS, meta?.styles || null);
+    built = { n: 0, scenes: [], tl: [], moments: [], state: initState(), gen: (built.gen || 0) + 1 };
+    complete = false; stats = null; ratings = null; analysis = { A: null, B: null };
+    // Pre-match: walk-out, line-ups, coin toss
+    const walk = C.buildMoment(C.withHalf(M0, 1), {}, { kind: 'walkout', seed: 11, sent: new Set() });
+    push({ kind: 'intro', dur: 7000, clip: walk });
+    push({ kind: 'lineup', side: 'A', dur: 6500, clip: walk });
+    push({ kind: 'lineup', side: 'B', dur: 6500, clip: walk });
+    built.tl.push({ start: 0, end: 7000, kind: 'intro', type: 'intro', itemIndex: -1, side: null, minute: '' });
+    built.tl.push({ start: 7000, end: 20000, kind: 'lineups', type: 'lineups', itemIndex: -1, side: null, minute: '' });
+  }
+  async function ensureKickoff() {
+    const st = built.state;
+    if (st.kickedOff) return;
+    st.kickedOff = true;
+    const ko = meta?.kickoff === 'B' ? 'B' : 'A';
+    st.firstKick = ko;
+    push({ kind: 'toss', dur: 2600, side: ko });
+    await clipScene({ type: 'kickoff', side: ko, min: 1, add: 0, text: `${TEAMS[ko].name} get us under way.` }, -1, 'kickoff', { live: true });
   }
 
-  function dotSprite(t, p) {
-    const c = makeCanvas(104, 48), g = c.getContext('2d');
-    const cx = 52, cy = 13;
-    g.fillStyle = 'rgba(0,0,0,0.32)'; g.beginPath(); g.ellipse(cx + 1.5, cy + 3, 11, 9, 0, 0, Math.PI * 2); g.fill();
-    g.fillStyle = t.css; g.beginPath(); g.arc(cx, cy, 10, 0, Math.PI * 2); g.fill();
-    g.lineWidth = 2.2; g.strokeStyle = t.light ? '#0b1410' : '#ffffff'; g.stroke();
-    if (p.i === 0) { g.lineWidth = 1.6; g.strokeStyle = t.light ? 'rgba(11,20,16,.7)' : 'rgba(255,255,255,.75)'; g.beginPath(); g.arc(cx, cy, 5, 0, Math.PI * 2); g.stroke(); }
-    const s = fitSize(p.short, 700, 11, 96, 8);
-    const f = font(700, s); const tw = textW(f, p.short);
-    g.fillStyle = 'rgba(4,10,7,0.62)'; roundRect(g, cx - tw / 2 - 5, 27, tw + 10, 16, 8); g.fill();
-    g.font = f; g.fillStyle = '#fff'; g.textAlign = 'center'; g.textBaseline = 'middle';
-    g.fillText(p.short, cx, 35.5);
-    return c;
-  }
-  function initialsSprite(t, p) {
-    const c = makeCanvas(128, 128), g = c.getContext('2d');
-    g.fillStyle = t.dark; g.beginPath(); g.arc(64, 64, 64, 0, Math.PI * 2); g.fill();
-    g.fillStyle = t.css; g.beginPath(); g.arc(64, 64, 58, 0, Math.PI * 2); g.fill();
-    g.fillStyle = t.ink; g.font = font(800, 46); g.textAlign = 'center'; g.textBaseline = 'middle';
-    g.fillText(initials(p.name), 64, 67);
-    return c;
-  }
-  function photoSprite(t, img) {
-    const c = makeCanvas(128, 128), g = c.getContext('2d');
-    g.save(); g.beginPath(); g.arc(64, 64, 64, 0, Math.PI * 2); g.clip();
-    g.fillStyle = '#d9e2dc'; g.fillRect(0, 0, 128, 128);
-    const iw = img.naturalWidth || img.width, ih = img.naturalHeight || img.height;
-    const s = Math.min(iw, ih * 0.82);
-    g.drawImage(img, (iw - s) / 2, ih * 0.02, s, s, 0, 0, 128, 128);
-    g.restore();
-    g.lineWidth = 6; g.strokeStyle = t.css; g.beginPath(); g.arc(64, 64, 61, 0, Math.PI * 2); g.stroke();
-    return c;
-  }
+  async function addItem(it, idx) {
+    const st = built.state;
+    if (st.outro) return;
+    if (it.kind === 'meta') { if (!meta) { meta = it.data; } return; }
+    if (it.kind === 'stats') { stats = it.data; maybeFT(); return; }
+    if (it.kind === 'ratings') { ratings = it.data; return; }
+    if (it.kind === 'analysis') { if (it.data?.side === 'A' || it.data?.side === 'B') analysis[it.data.side] = it.data; return; }
+    if (it.kind === 'end') { maybeFT(true); await buildOutro(); complete = true; return; }
+    if (it.kind === 'flow') { st.lastFlow = { ...it.data, idx }; built.tl.push({ start: st.t, end: st.t, kind: 'ev', type: 'flow', itemIndex: idx, side: it.data?.momentum || null, minute: it.data?.to ? `${it.data.to}'` : '' }); return; }
+    if (it.kind !== 'ev') return;
+    await ensureKickoff();
+    const ev = normEv(it.data || {});
+    const min = Number(ev.min) || st.lastMin || 1, add = Number(ev.add) || 0;
+    if (ev.type === 'kickoff' || ev.type === 'second_half') { built.tl.push({ start: st.t, end: st.t, kind: 'ev', type: ev.type, itemIndex: idx, side: ev.side || null, minute: minuteStr(min, add) }); return; }
+    if (ev.type === 'half_time') return halfTime(ev, idx, min, add);
+    if (ev.type === 'full_time') return fullTime(ev, idx, min, add);
+    if (min >= 46 && st.half === 1) await halfTime({ type: 'half_time', min: 45, add: 0, text: 'Half-time.' }, -1, 45, 0, true);
 
-  function findPlayer(side, name) {
-    if (!side || !name) return -1;
-    const t = T[side]; const n = norm(name);
-    if (t.lookup.has(n)) return t.lookup.get(n);
-    const sn = norm(surname(name));
-    if (t.lookup.has('~' + sn)) return t.lookup.get('~' + sn);
-    for (const p of t.players) { const pn = norm(p.name); if (pn.includes(n) || (n.length > 3 && n.includes(norm(p.short)))) return p.i; }
-    return -1;
-  }
-  function pickByRoles(side, roles, off, rnd) {
-    const ps = T[side].players.filter(p => p.i !== 0 && !off.has(side + p.i));
-    const pref = ps.filter(p => roles.includes(p.role));
-    const pool = pref.length ? pref : ps.length ? ps : T[side].players;
-    return pool[Math.floor(rnd() * pool.length) % pool.length].i;
-  }
-  const laneRoles = { left: ['LW', 'LM', 'LWB', 'LB'], right: ['RW', 'RM', 'RWB', 'RB'], center: ['ST', 'CAM', 'CM'] };
-  const finisherRoles = { left: ['LW', 'ST', 'LM'], right: ['RW', 'ST', 'RM'], center: ['ST', 'CAM', 'LW', 'RW'] };
-  const laneY = (side, zone) => {
-    const off = zone === 'left' ? -1 : zone === 'right' ? 1 : 0;
-    return CY + (side === 'A' ? off : -off) * 0.27 * FH;
-  };
-
-  // ---------------- positions
-  const OUT = { x: 0, y: 0, h: 0 };
-  function basePos(side, i, tilt, gt, out) {
-    const p = T[side].players[i];
-    let x = p.bx + tilt * p.k * FW;
-    let y = p.by;
-    const so = side === 'A' ? 0 : 2.1;
-    x += Math.sin(gt * 0.0021 + i * 1.7 + so) * 3.2;
-    y += Math.cos(gt * 0.0017 + i * 2.3 + so * 0.6) * 3.2;
-    out.x = x < FL - 10 ? FL - 10 : x > FR + 10 ? FR + 10 : x;
-    out.y = y < FT + 8 ? FT + 8 : y > FB - 8 ? FB - 8 : y;
-    return out;
-  }
-  function tiltAt(sc, lt) { return mix(sc.tilt0, sc.tilt1, easeInOut(seg(lt, 0, sc.tiltDur))); }
-  const TMP = { x: 0, y: 0, h: 0 };
-  function playerPos(sc, side, i, lt, out = OUT) {
-    basePos(side, i, tiltAt(sc, lt), sc.start + lt, out);
-    const a = sc.actors && sc.actors.get(side + i);
-    if (!a) return out;
-    const keys = a.keys;
-    if (lt <= keys[0][0]) { if (keys[0][1] != null) { out.x = keys[0][1]; out.y = keys[0][2]; } return out; }
-    for (let k = 1; k < keys.length; k++) {
-      const k0 = keys[k - 1], k1 = keys[k];
-      if (lt <= k1[0] || k === keys.length - 1) {
-        const p = easeInOut(seg(lt, k0[0], k1[0]));
-        const bx = out.x, by = out.y;
-        const x0 = k0[1] == null ? bx : k0[1], y0 = k0[1] == null ? by : k0[2];
-        const x1 = k1[1] == null ? bx : k1[1], y1 = k1[1] == null ? by : k1[2];
-        out.x = mix(x0, x1, p); out.y = mix(y0, y1, p);
-        return out;
+    // Stats from events (shown at half-time; full time uses GPT's stats when available).
+    const si = ev.side === 'B' ? 1 : 0;
+    let render = false, kind = null;
+    if (ev.type === 'shot') {
+      st.ev.shots[si]++; if (['goal', 'saved', 'parried', 'tipped'].includes(ev.outcome)) st.ev.onT[si]++;
+      render = true; kind = 'shot';
+    } else if (ev.type === 'foul') {
+      st.ev.fouls[si ? 0 : 1]++;
+      // Second booking → red
+      if (ev.card === 'yellow' && ev.offender) {
+        const k = `${ev.side}:${ev.offender}`, n = (st.yellows.get(k) || 0) + 1; st.yellows.set(k, n);
+        if (n >= 2) ev.card = 'second_yellow';
       }
-    }
-    return out;
-  }
-  function ballPos(sc, lt, out = OUT) {
-    const k = sc.kf;
-    if (lt <= k[0].t) { out.x = k[0].x; out.y = k[0].y; out.h = 0; return out; }
-    for (let i = 1; i < k.length; i++) {
-      const b = k[i];
-      if (lt <= b.t || i === k.length - 1) {
-        const a = k[i - 1];
-        const raw = seg(lt, a.t, b.t);
-        const p = (b.ease || easeInOut)(raw);
-        if (b.cx != null) {
-          const u = 1 - p;
-          out.x = u * u * a.x + 2 * u * p * b.cx + p * p * b.x;
-          out.y = u * u * a.y + 2 * u * p * b.cy + p * p * b.y;
-        } else { out.x = mix(a.x, b.x, p); out.y = mix(a.y, b.y, p); }
-        out.h = b.arc ? 4 * b.arc * raw * (1 - raw) : 0;
-        return out;
-      }
-    }
-    return out;
-  }
+      if (ev.card === 'yellow') st.ev.yellow[si ? 0 : 1]++;
+      if (ev.card === 'red' || ev.card === 'second_yellow') st.ev.red[si ? 0 : 1]++;
+      const { u } = { u: (Number(ev.x) || 50) * 1.05 };
+      render = !!ev.card || ev.penalty || u >= 66;
+      kind = 'foul';
+    } else if (ev.type === 'offside') { st.ev.offsides[si]++; render = true; kind = 'offside'; }
+    else if (ev.type === 'corner') { st.ev.corners[si]++; render = (min - st.lastRendered) >= 4; kind = 'corner'; }
+    else if (ev.type === 'injury') { render = true; kind = 'injury'; }
+    else if (ev.type === 'var') { render = true; kind = 'var'; }
 
-  // ---------------- timeline builder
-  let scenes, st, items0, processed, complete, meta, stats, ratings, analysis;
-  function reset() {
-    scenes = []; processed = 0; complete = false; meta = null; stats = null; ratings = null; analysis = {};
-    items0 = [];
-    st = {
-      t: 0, score: [0, 0], tilt: 0, ball: { x: CX, y: CY }, clock: 0, off: new Set(), poss: 'A',
-      pending: null, pendingFT: null, kickoffDone: false, seed: 1,
-    };
-    pushScene({ kind: 'intro', dur: 4200, bug: false });
-    pushScene({ kind: 'lineups', dur: 5200, bug: false });
-  }
-
-  function pushScene(sc) {
-    sc.start = st.t;
-    sc.scoreBefore = sc.scoreBefore || [st.score[0], st.score[1]];
-    sc.scoreAfter = sc.scoreAfter || sc.scoreBefore;
-    sc.goalT = sc.goalT ?? Infinity;
-    sc.tilt0 = sc.tilt0 ?? st.tilt;
-    sc.tilt1 = sc.tilt1 ?? st.tilt;
-    sc.tiltDur = sc.tiltDur ?? Math.min(800, sc.dur * 0.6);
-    sc.off = sc.off || new Set(st.off);
-    sc.clock0 = sc.clock0 ?? st.clock;
-    sc.clock1 = sc.clock1 ?? st.clock;
-    sc.caption = sc.caption || [];
-    if (!sc.kf) sc.kf = [{ t: 0, x: st.ball.x, y: st.ball.y }];
-    if (sc.bug === undefined) sc.bug = true;
-    scenes.push(sc);
-    st.t += sc.dur;
-    st.tilt = sc.tilt1;
-    st.clock = sc.clock1;
-    const end = ballPos(sc, sc.dur, { x: 0, y: 0, h: 0 });
-    st.ball = { x: end.x, y: end.y };
-    return sc;
-  }
-  // Positions at build time need the scene's start, so allocate it first.
-  function newScene(kind, dur, extra = {}) {
-    return Object.assign({ kind, dur, start: st.t, tilt0: st.tilt, off: new Set(st.off), actors: new Map() }, extra);
-  }
-  function pp(sc, side, i, lt) { const o = playerPos(sc, side, i, lt, { x: 0, y: 0, h: 0 }); return [o.x, o.y]; }
-  const minuteLabel = d => (d.add > 0 ? `${d.min}+${d.add}'` : `${d.min}'`);
-  function clockFor(d) {
-    const m = Number(d.min) || 0;
-    if (d.add > 0) return m;
-    return Math.max(st.clock, m - 0.5);
-  }
-  function rngFor(idx) { return mulberry32((idx + 1) * 2654435761 ^ 0x9e3779b9); }
-
-  function ensureKickoff() {
-    if (st.kickoffDone) return;
-    st.kickoffDone = true;
-    const kick = meta?.kickoff === 'B' ? 'B' : 'A';
-    const sc = newScene('kickoff', 3400, { kick, headline: meta?.headline || '', referee: meta?.referee || '', weather: meta?.weather || '', bug: true, clock0: 0, clock1: 0, label: '' });
-    sc.tilt0 = 0; sc.tilt1 = 0;
-    for (const side of ['A', 'B']) for (let i = 0; i < 11; i++) {
-      const d = i * 55 + (side === 'B' ? 25 : 0);
-      sc.actors.set(side + i, { keys: [[0, TUNNEL[0], TUNNEL[1]], [150 + d, TUNNEL[0], TUNNEL[1]], [1500 + d, null, 0]] });
-    }
-    sc.kf = [{ t: 0, x: CX, y: CY }, { t: sc.dur, x: CX, y: CY }];
-    sc.caption = sc.headline ? [{ t0: 1900, t1: sc.dur, text: sc.headline, badge: 'KO', side: kick }] : [];
-    pushScene(sc);
-    st.poss = kick;
-  }
-
-  function flushPending() {
-    const g = st.pending;
-    if (!g) return;
-    st.pending = null;
-    const first = g.items[0].data;
-    let side = g.items.map(x => x.data.side).find(s => s === 'A' || s === 'B') || st.poss;
-    const n = g.items.length;
-    const dur = Math.min(1500, 640 + 280 * (n - 1));
-    const rnd = rngFor(g.items[0].index);
-    const isFoul = g.items.every(x => x.data.type === 'foul');
-    const sc = newScene('beat', dur, { side, eventIndex: g.items[0].index, label: minuteLabel(first) });
-    sc.tilt1 = isFoul ? st.tilt * 0.7 : (side === 'A' ? 0.26 : -0.26) + (rnd() - 0.5) * 0.12;
-    sc.tiltDur = dur * 0.8;
-    sc.clock0 = st.clock; sc.clock1 = clockFor(first); sc.stoppage = first.add > 0 ? first.add : 0; sc.min = first.min;
-    const zone = first.zone || ['left', 'center', 'right'][Math.floor(rnd() * 3)];
-    const i1 = pickByRoles(side, laneRoles[zone], sc.off, rnd);
-    let i2 = pickByRoles(side, rnd() < 0.5 ? laneRoles.center : laneRoles[zone], sc.off, rnd);
-    if (i2 === i1) i2 = pickByRoles(side, ['CM', 'CDM', 'CAM', 'ST'], sc.off, rnd);
-    const [x1, y1] = pp(sc, side, i1, dur * 0.42);
-    const [x2, y2] = pp(sc, side, i2, dur * 0.92);
-    sc.kf = [{ t: 0, x: st.ball.x, y: st.ball.y }, { t: dur * 0.42, x: x1, y: y1, ease: swift }, { t: dur * 0.92, x: x2, y: y2, ease: swift, arc: rnd() < 0.3 ? 14 : 0 }, { t: dur, x: x2, y: y2 }];
-    const slot = dur / n;
-    sc.caption = g.items.map((x, k) => ({ t0: k * slot, t1: (k + 1) * slot, text: x.data.text || '', badge: minuteLabel(x.data), side: x.data.side, icon: x.data.type === 'foul' ? 'whistle' : null, index: x.index, type: x.data.type }));
-    pushScene(sc);
-    st.poss = side;
-  }
-
-  function addEvent(d, index) {
-    const type = KNOWN.has(d.type) ? d.type : 'commentary';
-    if (type === 'full_time') { flushPending(); st.pendingFT = { d, index }; return; }
-    if (MINOR.has(type)) {
-      const key = `${d.min}+${d.add || 0}`;
-      if (st.pending && st.pending.key === key && st.pending.items.length < 4) st.pending.items.push({ data: { ...d, type }, index });
-      else { flushPending(); st.pending = { key, items: [{ data: { ...d, type }, index }] }; }
+    if (!render) {
+      built.tl.push({ start: st.t, end: st.t, kind: 'ev', type: ev.type, itemIndex: idx, side: ev.side || null, minute: minuteStr(min, add) });
+      st.lastMin = min;
       return;
     }
-    flushPending();
-    if (ACTION.has(type) || type === 'penalty_miss') return actionScene(d, type, index);
-    if (GOALS.has(type)) return actionScene(d, type, index);
-    if (CARDS.has(type)) return cardScene(d, type, index);
-    if (type === 'var') return staticScene(d, 'var', 2300, index);
-    if (type === 'injury') return staticScene(d, 'injury', 1500, index);
-    if (type === 'offside') return staticScene(d, 'offside', 1400, index);
-    if (type === 'half_time') return breakScene(d, 'ht', index);
-    if (type === 'second_half') return secondHalf(d, index);
+    // A spell of play between big moments.
+    if (min - st.lastRendered >= 9 && kind !== 'var') {
+      const f = st.lastFlow;
+      await clipScene({ type: 'flow', side: f?.momentum === 'B' ? 'B' : f?.momentum === 'A' ? 'A' : (min % 2 ? 'A' : 'B'), min: Math.max(st.lastRendered + 3, min - 4), add: 0, text: f?.note || '' }, -1, 'flow', { live: true, short: true });
+    }
+    if (kind === 'var') varScene(ev, idx, min, add);
+    else await clipScene(ev, idx, kind, {});
+    st.lastMin = min; st.lastRendered = min;
   }
 
-  function staticScene(d, kind, dur, index) {
-    const side = d.side === 'A' || d.side === 'B' ? d.side : st.poss;
-    const sc = newScene(kind, dur, { side, eventIndex: index, evType: kind, label: minuteLabel(d), clock0: st.clock, clock1: clockFor(d), stoppage: d.add > 0 ? d.add : 0, min: d.min });
-    sc.tilt1 = st.tilt * 0.8;
-    const rnd = rngFor(index);
-    if (kind === 'offside') {
-      const i1 = pickByRoles(side, ['CM', 'CAM', 'CDM'], sc.off, rnd), i2 = pickByRoles(side, ['ST', 'LW', 'RW'], sc.off, rnd);
-      const [x1, y1] = pp(sc, side, i1, 400), [x2, y2] = pp(sc, side, i2, 900);
-      sc.kf = [{ t: 0, x: st.ball.x, y: st.ball.y }, { t: 400, x: x1, y: y1 }, { t: 900, x: x2, y: y2, arc: 10 }, { t: dur, x: x2, y: y2 }];
-    } else sc.kf = [{ t: 0, x: st.ball.x, y: st.ball.y }, { t: dur, x: st.ball.x, y: st.ball.y }];
-    sc.caption = [{ t0: 0, t1: dur, text: d.text || '', badge: minuteLabel(d), side: d.side, icon: kind }];
-    sc.player = d.player || '';
-    pushScene(sc);
-  }
-
-  function cardScene(d, type, index) {
-    const side = d.side === 'A' || d.side === 'B' ? d.side : other(st.poss);
-    const dur = type === 'second_yellow' ? 2600 : 2000;
-    const sc = newScene('card', dur, { side, cardType: type, evType: type, eventIndex: index, label: minuteLabel(d), clock0: st.clock, clock1: clockFor(d), stoppage: d.add > 0 ? d.add : 0, min: d.min, player: d.player || '' });
-    sc.tilt1 = st.tilt * 0.6;
-    sc.kf = [{ t: 0, x: st.ball.x, y: st.ball.y }, { t: dur, x: st.ball.x, y: st.ball.y }];
-    sc.caption = [{ t0: 250, t1: dur, text: d.text || '', badge: minuteLabel(d), side, icon: 'card' }];
-    if (type !== 'yellow') {
-      const i = findPlayer(side, d.player);
-      if (i > 0 || (i === 0 && T[side].players[0])) { sc.offKey = side + i; sc.offAt = dur * 0.62; }
-    }
-    pushScene(sc);
-    if (sc.offKey) st.off.add(sc.offKey);
-  }
-
-  function breakScene(d, which, index) {
-    const sc = newScene(which, which === 'ht' ? 3100 : 4400, { eventIndex: index ?? -1, evType: which === 'ht' ? 'half_time' : 'full_time', label: which === 'ht' ? 'HT' : 'FT' });
-    sc.clock0 = st.clock; sc.clock1 = which === 'ht' ? 45 : 90;
-    sc.tilt1 = 0; sc.tiltDur = 1200;
-    sc.kf = [{ t: 0, x: st.ball.x, y: st.ball.y }, { t: 900, x: CX, y: CY }, { t: sc.dur, x: CX, y: CY }];
-    sc.text = d?.text || '';
-    if (which === 'ft') sc.stats = stats;
-    pushScene(sc);
-    if (which === 'ht') st.clock = 45;
-  }
-
-  function secondHalf(d, index) {
-    const kick = meta?.kickoff === 'A' ? 'B' : 'A';
-    const sc = newScene('second', 1700, { eventIndex: index, evType: 'second_half', label: "46'", kick });
-    sc.clock0 = 45; sc.clock1 = 45;
-    sc.tilt1 = 0;
-    sc.kf = [{ t: 0, x: CX, y: CY }, { t: sc.dur, x: CX, y: CY }];
-    sc.caption = d?.text ? [{ t0: 300, t1: sc.dur, text: d.text, badge: "46'", side: null }] : [];
-    pushScene(sc);
-    st.poss = kick;
-  }
-
-  function actionScene(d, type, index) {
-    const rnd = rngFor(index);
-    let side = d.side === 'A' || d.side === 'B' ? d.side : st.poss;
-    const isGoal = GOALS.has(type), isPen = type === 'penalty_goal' || type === 'penalty_miss', isOG = type === 'own_goal';
-    const dir = dirOf(side), gx = goalX(side), opp = other(side);
-    const zone = d.zone === 'left' || d.zone === 'right' || d.zone === 'center' ? d.zone : (['left', 'center', 'right'][Math.floor(rnd() * 3)]);
-    let outcome = isGoal ? 'goal' : type === 'penalty_miss' ? (/\b(save|keeper|saved|denied)/.test(norm(d.text)) ? 'save' : (/post|bar/.test(norm(d.text)) ? 'post' : 'over')) : outcomeFor(type, d.text);
-    if (type === 'corner' && outcome === 'wide' && rnd() < 0.4) outcome = 'caught';
-    const dur = isPen ? (isGoal ? 5000 : 3100) : isGoal ? (isOG ? 4500 : 4700) : type === 'corner' || type === 'free_kick' ? 2400 : 2150;
-    const kind = isGoal ? 'goal' : 'action';
-    const sc = newScene(kind, dur, { side, type, evType: type, outcome, eventIndex: index, label: minuteLabel(d), clock0: st.clock, clock1: clockFor(d), stoppage: d.add > 0 ? d.add : 0, min: d.min, player: d.player || '', assist: d.assist || '' });
-    sc.tilt1 = isPen ? (side === 'A' ? 0.7 : -0.7) : (side === 'A' ? 0.58 : -0.58);
-    sc.tiltDur = isPen ? 900 : 750;
-    const actors = sc.actors;
-    const gkOpp = 0;
-
-    // who
-    let shooter = isOG ? pickByRoles(side, finisherRoles[zone], sc.off, rnd) : findPlayer(side, d.player);
-    if (shooter < 0 || sc.off.has(side + shooter)) shooter = pickByRoles(side, finisherRoles[zone], sc.off, rnd);
-    let passer = findPlayer(side, d.assist);
-    if (passer < 0 || passer === shooter || sc.off.has(side + passer)) passer = pickByRoles(side, laneRoles[zone].concat(['CM', 'CAM']), sc.off, rnd);
-    if (passer === shooter) passer = pickByRoles(side, ['CM', 'CDM', 'CAM'], sc.off, rnd);
-    let ogDef = isOG ? findPlayer(opp, d.player) : -1;
-    if (isOG && ogDef < 0) ogDef = pickByRoles(opp, ['CB'], sc.off, rnd);
-    sc.shooter = shooter; sc.passer = passer; sc.ogDef = ogDef;
-
-    // where
-    const ly = laneY(side, zone);
-    const spotDepth = isPen ? SPOT : SPOT * (0.75 + rnd() * 0.75);
-    const shot = { x: gx - dir * spotDepth, y: isPen ? CY : mix(CY, ly, 0.45) + (rnd() - 0.5) * 40 };
-    const fk = type === 'free_kick' ? { x: gx - dir * (BOXD + 70 + rnd() * 50), y: mix(CY, ly, 0.5) } : null;
-    if (fk) { shot.x = fk.x; shot.y = fk.y; }
-    const gyIn = CY + (rnd() < 0.5 ? -1 : 1) * GH * (0.35 + rnd() * 0.45);
-    let target, after;
-    let dive = null;
-    if (outcome === 'goal') {
-      target = { x: gx + dir * 9, y: gyIn };
-      after = { x: gx + dir * (GD - 3), y: gyIn + (rnd() - 0.5) * 8 };
-      dive = { x: gx - dir * 10, y: CY - (gyIn - CY) * 0.9 };          // dives the wrong way
-    } else if (outcome === 'save' || outcome === 'caught') {
-      const sy = CY + (rnd() - 0.5) * GH * 1.4;
-      target = { x: gx - dir * 12, y: sy };
-      dive = { x: target.x, y: sy };
-      after = outcome === 'caught' ? { ...target } : { x: gx - dir * (55 + rnd() * 40), y: sy + (sy < CY ? -1 : 1) * (60 + rnd() * 50) };
-    } else if (outcome === 'post') {
-      const py = CY + (rnd() < 0.5 ? -1 : 1) * GH;
-      target = { x: gx, y: py };
-      after = { x: gx - dir * (80 + rnd() * 50), y: py + (py < CY ? -1 : 1) * (40 + rnd() * 40) };
-      dive = { x: gx - dir * 10, y: py + (py < CY ? 1 : -1) * 6 };
-    } else if (outcome === 'block') {
-      target = { x: mix(shot.x, gx, 0.32), y: mix(shot.y, CY, 0.32) };
-      after = { x: target.x - dir * 30, y: target.y + (rnd() < 0.5 ? -1 : 1) * 70 };
-    } else {
-      const wy = CY + (rnd() < 0.5 ? -1 : 1) * (GH + 22 + rnd() * 50);
-      target = { x: gx + dir * 26, y: outcome === 'over' ? CY + (rnd() - 0.5) * GH : wy };
-      after = { x: gx + dir * 34, y: target.y };
-    }
-
-    // timings
-    const tPass = isPen ? 500 : type === 'corner' ? 700 : 520;
-    const tRecv = isPen ? 1300 : type === 'corner' ? 1250 : 1050;
-    const tShot = tRecv + (isPen ? 320 : 330);
-    const tAfter = tShot + 420;
-    sc.tShot = tRecv; sc.tHit = tShot;
-
-    // actors
-    if (isPen) {
-      const run0 = { x: shot.x - dir * 46, y: CY + 14 };
-      actors.set(side + shooter, { keys: [[0, null, 0], [500, run0.x, run0.y], [tRecv - 120, run0.x, run0.y], [tRecv + 40, shot.x - dir * 6, CY], [dur - 500, shot.x - dir * 6, CY], [dur, null, 0]] });
-      // everyone else waits outside the box: sorted by height, spaced apart, alternating two lines
-      const moved = [];
-      for (const s of ['A', 'B']) for (let i = 1; i < 11; i++) {
-        if (s === side && i === shooter) continue;
-        const [bx, by] = pp(sc, s, i, 700);
-        if (side === 'A' ? bx > gx - BOXD - 40 : bx < gx + BOXD + 40) moved.push({ s, i, by });
-      }
-      moved.sort((a, b) => a.by - b.by);
-      const gap = 30, span = (moved.length - 1) * gap;
-      let y0 = Math.max(FT + 24, Math.min(FB - 24 - span, CY - span / 2));
-      moved.forEach((m, k) => {
-        const tx = gx - dir * (BOXD + 30 + (k % 2) * 34);
-        const ty = y0 + k * gap;
-        actors.set(m.s + m.i, { keys: [[0, null, 0], [700, tx, ty], [dur - 400, tx, ty], [dur, null, 0]] });
-      });
-    } else {
-      actors.set(side + shooter, { keys: [[0, null, 0], [180, null, 0], [tRecv - 40, shot.x, shot.y], [dur - 700, shot.x + dir * 14, shot.y], [dur, null, 0]] });
-    }
-    if (dive) {
-      actors.set(opp + gkOpp, { keys: [[0, null, 0], [tShot - 140, null, 0], [tShot + 60, dive.x, dive.y], [dur - 600, dive.x, dive.y], [dur, null, 0]] });
-    }
-    if (outcome === 'block') {
-      const blk = pickByRoles(opp, ['CB', 'CDM'], sc.off, rnd);
-      actors.set(opp + blk, { keys: [[0, null, 0], [tRecv - 300, null, 0], [tShot - 30, target.x, target.y], [dur - 500, target.x, target.y], [dur, null, 0]] });
-    }
-    if (isOG && ogDef >= 0) {
-      const ogSpot = { x: gx - dir * 34, y: CY + (ly > CY ? 1 : -1) * 28 };
-      actors.set(opp + ogDef, { keys: [[0, null, 0], [tRecv - 200, null, 0], [tShot - 60, ogSpot.x, ogSpot.y], [dur - 600, ogSpot.x, ogSpot.y], [dur, null, 0]] });
-      sc.ogSpot = ogSpot;
-    }
-
-    // ball path
-    const kf = [{ t: 0, x: st.ball.x, y: st.ball.y }];
-    if (isPen) {
-      kf.push({ t: 600, x: shot.x, y: shot.y, ease: smooth });
-      kf.push({ t: tRecv, x: shot.x, y: shot.y });
-    } else if (type === 'corner') {
-      const cy = ly < CY ? FT + 4 : FB - 4;
-      kf.push({ t: tPass, x: gx - dir * 3, y: cy, ease: swift });
-      kf.push({ t: tRecv, x: shot.x, y: shot.y, arc: 34, cx: gx - dir * 90, cy: mix(cy, CY, 0.3), ease: easeInOut });
-    } else if (fk) {
-      kf.push({ t: tPass, x: fk.x, y: fk.y, ease: smooth });
-      kf.push({ t: tRecv, x: fk.x, y: fk.y });
-      actors.set(side + shooter, { keys: [[0, null, 0], [tPass, fk.x - dir * 30, fk.y + 10], [tRecv, fk.x - dir * 8, fk.y], [dur - 500, fk.x - dir * 8, fk.y], [dur, null, 0]] });
-    } else {
-      const [px, py] = pp(sc, side, passer, tPass);
-      kf.push({ t: tPass, x: px, y: py, ease: swift });
-      kf.push({ t: tRecv, x: shot.x, y: shot.y, ease: swift, arc: rnd() < 0.45 ? 18 : 0 });
-    }
-    if (isOG) {
-      kf.push({ t: tShot - 90, x: sc.ogSpot.x, y: sc.ogSpot.y, ease: swift });
-      kf.push({ t: tShot + 140, x: target.x, y: target.y, ease: easeIn });
-    } else {
-      const curve = type === 'free_kick' ? { cx: mix(shot.x, target.x, 0.5), cy: mix(shot.y, target.y, 0.5) + (rnd() < 0.5 ? -1 : 1) * 70 } : {};
-      kf.push({ t: tShot, x: target.x, y: target.y, ease: easeIn, arc: outcome === 'over' ? 26 : type === 'corner' ? 6 : 8, ...curve });
-    }
-    kf.push({ t: tAfter, x: after.x, y: after.y, ease: easeOut });
+  // One scripted moment → live clip (+ replay + analysis freeze for big moments).
+  async function clipScene(ev, idx, kind, opt) {
+    const st = built.state;
+    const half = (Number(ev.min) || 1) >= 46 || st.half === 2 ? 2 : 1;
+    const M = C.withHalf(M0, half);
+    const seed = C.hashStr(`${idx}|${ev.type}|${ev.min}|${ev.add}|${ev.player}|${ev.text}`);
+    const ctx = { kind, seed, sent: new Set(st.sent), setup: (ev.type === 'shot' && (ev.assist_type === 'free_kick' || ev.technique === 'free_kick' || ev.technique === 'penalty' || ev.assist_type === 'penalty')) ? st.setup : null };
+    let clip;
+    try { clip = await build(half, ev, ctx); } catch (e) { console.warn('clip failed', e); return; }
+    const min = Number(ev.min) || 1, add = Number(ev.add) || 0;
+    const scoreBefore = [...st.score];
+    const isGoal = kind === 'shot' && ev.outcome === 'goal';
+    const scorerSide = ev.side;
+    const climax = clip.info.climax || 0;
+    const sc = push({ kind: 'clip', clip, ev, idx, M, half, dur: Math.round(clip.dur * 1000), min, add, scoreBefore, climax, isGoal, isWipe: !opt.short, live: true });
+    if (idx >= 0) built.tl.push({ start: sc.start + Math.max(0, climax * 1000 - 300), end: sc.start + sc.dur, kind: 'ev', type: ev.type === 'shot' ? (ev.outcome === 'goal' ? (ev.ownGoal ? 'own_goal' : ev.technique === 'penalty' ? 'penalty_goal' : 'goal') : ev.outcome === 'woodwork' ? 'woodwork' : ev.outcome === 'blocked' ? 'block' : ['saved', 'parried', 'tipped'].includes(ev.outcome) ? 'save' : ev.outcome === 'disallowed' ? 'var' : 'shot') : ev.type === 'foul' ? (ev.card ? (ev.card === 'yellow' ? 'yellow' : 'red') : ev.penalty ? 'penalty' : 'foul') : ev.type, itemIndex: idx, side: ev.side || null, minute: minuteStr(min, add) });
     if (isGoal) {
-      kf.push({ t: dur - 260, x: after.x, y: after.y });
-      kf.push({ t: dur, x: CX, y: CY, ease: easeInOut });
-    } else {
-      kf.push({ t: dur, x: after.x, y: after.y });
+      st.score[scorerSide === 'B' ? 1 : 0]++;
+      sc.goalAt = sc.start + Math.round((clip.marks.goalT || climax) * 1000);
+      st.goals.push({ side: scorerSide, name: ev.ownGoal ? `${ev.og} (OG)` : ev.player, min: minuteStr(min, add), pen: ev.technique === 'penalty' });
     }
-    sc.kf = kf;
-    sc.target = target;
-
-    // camera: push in on the goal, then back out
-    const focus = { x: mix(shot.x, gx, 0.45), y: mix(shot.y, CY, 0.5) };
-    sc.cam = { x: focus.x, y: focus.y, z: isPen ? 1.42 : 1.24, in0: isPen ? 200 : 300, in1: isPen ? 1100 : 1000, out0: isGoal ? 2300 : dur - 650, out1: isGoal ? 3300 : dur };
-
-    // scoring
+    if (kind === 'foul') {
+      if (clip.marks.setup) st.setup = clip.marks.setup;
+      if (ev.card === 'red' || ev.card === 'second_yellow') { const a = clip.info.offender; if (a != null) st.sent.add(a); }
+      if (ev.card) st.cards.push({ side: ev.side === 'A' ? 'B' : 'A', name: ev.offender, color: ev.card === 'yellow' ? 'yellow' : 'red', min: minuteStr(min, add) });
+    } else st.setup = null;
+    const big = isGoal || (kind === 'shot' && (['woodwork', 'disallowed'].includes(ev.outcome) || (['saved', 'parried', 'tipped'].includes(ev.outcome) && (Number(ev.xg) >= 0.25 || ev.technique === 'penalty')))) || (kind === 'foul' && (ev.card === 'red' || ev.card === 'second_yellow' || ev.penalty)) || kind === 'offside';
+    if (big && !opt.live) {
+      const replayCam = kind === 'shot' ? 'goal' : 'reverse';
+      const from = Math.max(0, climax - (isGoal ? 3.6 : 2.6)), to = Math.min(clip.dur - 0.1, climax + (isGoal ? 1.7 : 1.4));
+      const slow = 0.5;
+      push({ kind: 'replay', clip, ev, M, half, from, to, slow, cam: replayCam, dur: Math.round(((to - from) / slow) * 1000), min, add, scoreBefore: [...st.score] });
+      const fr = push({ kind: 'freeze', clip, ev, M, half, at: freezeAt(clip, kind, ev), dur: 5200, min, add, scoreBefore: [...st.score], idx });
+      built.moments.push({ t: fr.start + 1600, title: momentTitle(ev, kind), minute: minuteStr(min, add), side: ev.side, type: built.tl[built.tl.length - 1]?.type || kind });
+    }
     if (isGoal) {
-      sc.goalT = tShot - (isOG ? 0 : 20);
-      const s = [st.score[0], st.score[1]];
-      s[side === 'A' ? 0 : 1]++;
-      sc.scoreAfter = s;
-      const conf = new Float32Array(110 * 6);
-      for (let k = 0; k < 110; k++) {
-        conf[k * 6] = rnd() * W; conf[k * 6 + 1] = -30 - rnd() * 260; conf[k * 6 + 2] = 140 + rnd() * 220;
-        conf[k * 6 + 3] = (rnd() - 0.5) * 90; conf[k * 6 + 4] = rnd() * 6.28; conf[k * 6 + 5] = Math.floor(rnd() * 3);
+      // Restart: kick-off by the team that conceded.
+      const conceding = scorerSide === 'A' ? 'B' : 'A';
+      const ko = await build(half, { side: conceding }, { kind: 'kickoff', seed: seed ^ 0x9e37, sent: new Set(st.sent) });
+      push({ kind: 'clip', clip: ko, ev: { type: 'kickoff', side: conceding, min, add, text: '' }, idx: -1, M, half, dur: 3600, min, add, scoreBefore: [...st.score], climax: 1, trimStart: 0.3, isWipe: false });
+    }
+  }
+  function freezeAt(clip, kind, ev) {
+    if (kind === 'offside') return clip.marks.offside?.t ?? clip.info.climax;
+    if (kind === 'foul') return (clip.marks.foul?.t ?? clip.info.climax) + 0.05;
+    if (kind === 'shot') {
+      if (clip.marks.offside) return clip.marks.offside.t;
+      if (ev.outcome === 'goal' || ev.outcome === 'woodwork') return (clip.marks.shot?.t ?? clip.info.climax) + Math.min(0.35, (clip.marks.shot?.dur || 0.5) * 0.55);
+      return (clip.marks.saveT ?? clip.info.climax) - 0.05;
+    }
+    return clip.info.climax;
+  }
+  function momentTitle(ev, kind) {
+    if (kind === 'shot') {
+      if (ev.outcome === 'goal') return ev.ownGoal ? `Own goal — ${ev.og}` : `${ev.technique === 'penalty' ? 'Penalty goal' : 'Goal'} — ${ev.player}`;
+      if (ev.outcome === 'disallowed') return `Disallowed — ${ev.player}`;
+      if (ev.outcome === 'woodwork') return `Woodwork — ${ev.player}`;
+      const opp = ev.side === 'A' ? 'B' : 'A';
+      const gk = M0.teams[opp]?.players.find(p => p.role === 'GK')?.name;
+      return gk ? `Save — ${surname(gk)} denies ${surname(ev.player)}` : `Save — ${ev.player}`;
+    }
+    if (kind === 'foul') return ev.penalty ? `Penalty — ${ev.player || ''}` : `${ev.card === 'yellow' ? 'Booking' : 'Red card'} — ${ev.offender}`;
+    if (kind === 'offside') return `Offside — ${ev.player}`;
+    return ev.text || kind;
+  }
+
+  function varScene(ev, idx, min, add) {
+    const st = built.state;
+    const last = [...built.scenes].reverse().find(s => s.kind === 'clip');
+    const sc = push({ kind: 'var', ev, idx, dur: 4200, min, add, scoreBefore: [...st.score], clip: last?.clip, M: last?.M, at: last ? last.clip.dur - 0.2 : 0 });
+    built.tl.push({ start: sc.start, end: sc.start + sc.dur, kind: 'ev', type: 'var', itemIndex: idx, side: ev.side || null, minute: minuteStr(min, add) });
+  }
+
+  async function halfTime(ev, idx, min, add, synthetic) {
+    const st = built.state;
+    if (st.htDone) return;
+    await ensureKickoff();
+    st.htDone = true;
+    const M = C.withHalf(M0, 1);
+    const wh = await build(1, { type: 'half_time', text: ev.text }, { kind: 'whistle', seed: 77, sent: new Set(st.sent) });
+    const sc = push({ kind: 'clip', clip: wh, ev: { ...ev, type: 'half_time' }, idx, M, half: 1, dur: Math.round(wh.dur * 1000), min: 45, add: add || 0, scoreBefore: [...st.score], climax: 1.6, isWipe: true });
+    if (idx >= 0) built.tl.push({ start: sc.start + 1200, end: sc.start + sc.dur, kind: 'ev', type: 'half_time', itemIndex: idx, side: null, minute: minuteStr(45, add) });
+    push({ kind: 'ht', dur: 8000, score: [...st.score], stats: JSON.parse(JSON.stringify(st.ev)), goals: [...st.goals], cards: [...st.cards] });
+    push({ kind: 'switch', dur: 3200 });
+    st.half = 2; st.setup = null; st.lastRendered = 46;
+    const ko = st.firstKick === 'A' ? 'B' : 'A';
+    const M2 = C.withHalf(M0, 2);
+    const k = await build(2, { side: ko }, { kind: 'kickoff', seed: 99, sent: new Set(st.sent) });
+    push({ kind: 'clip', clip: k, ev: { type: 'second_half', side: ko, min: 46, add: 0, text: `Second half under way — ${TEAMS[ko].name} kick off.` }, idx: -1, M: M2, half: 2, dur: Math.round(k.dur * 1000), min: 46, add: 0, scoreBefore: [...st.score], climax: 1, isWipe: false });
+  }
+  async function fullTime(ev, idx, min, add) {
+    const st = built.state;
+    if (st.ftStart != null) return;
+    await ensureKickoff();
+    if (!st.htDone) await halfTime({ type: 'half_time', min: 45, add: 0 }, -1, 45, 0, true);
+    const M = C.withHalf(M0, 2);
+    const winner = st.score[0] > st.score[1] ? 'A' : st.score[1] > st.score[0] ? 'B' : null;
+    st.ftStart = 'building';
+    const wh = await build(2, { type: 'full_time', winner, text: ev.text }, { kind: 'whistle', seed: 88, sent: new Set(st.sent) });
+    const sc = push({ kind: 'clip', clip: wh, ev: { ...ev, type: 'full_time' }, idx, M, half: 2, dur: Math.round(wh.dur * 1000), min: 90, add: add || 0, scoreBefore: [...st.score], climax: 1.6, isWipe: true });
+    st.ftWhistle = sc.start + 1500;
+    if (idx >= 0) built.tl.push({ start: sc.start + 1500, end: sc.start + sc.dur, kind: 'ev', type: 'full_time', itemIndex: idx, side: null, minute: minuteStr(90, add) });
+    st.ftStart = 'pending';
+    maybeFT();
+  }
+  function maybeFT(force) {
+    const st = built.state;
+    if (st.ftStart !== 'pending' || (!stats && !force)) return;
+    const sc = push({ kind: 'ft', dur: 9000, score: [...st.score], goals: [...st.goals], cards: [...st.cards], ev: JSON.parse(JSON.stringify(st.ev)) });
+    st.ftStart = sc.start;
+    built.tl.push({ start: sc.start, end: sc.start + sc.dur, kind: 'fulltime', type: 'fulltime', itemIndex: -1, side: null, minute: 'FT' });
+  }
+  async function buildOutro() {
+    const st = built.state;
+    if (st.outro) return;
+    if (st.ftStart == null) await fullTime({ type: 'full_time', min: 90, add: 0 }, -1, 90, 0);
+    if (st.ftStart === 'pending') maybeFT(true);
+    st.outro = true;
+    const s0 = st.t;
+    if (stats?.motm) push({ kind: 'motm', dur: 6500 });
+    if (ratings) push({ kind: 'ratings', dur: 7000 });
+    if (analysis.A) push({ kind: 'analysis', side: 'A', dur: 9500 });
+    if (analysis.B) push({ kind: 'analysis', side: 'B', dur: 9500 });
+    if (built.moments.length) push({ kind: 'montage', dur: 7000 });
+    push({ kind: 'end', dur: 4500 });
+    built.tl.push({ start: s0, end: st.t, kind: 'outro', type: 'outro', itemIndex: -1, side: null, minute: 'FT' });
+  }
+
+  // ---------------------------------------------------------------- looks & kits
+  function makeKits(T) {
+    const GK = ['#22c55e', '#facc15', '#a855f7', '#f97316', '#06b6d4', '#ec4899', '#111827'];
+    const used = [T.A.color, T.B.color];
+    const gk = [];
+    for (const c of GK) { if (used.every(u => colorDist(u, c) > 120) && gk.every(g => colorDist(g, c) > 120)) gk.push(c); if (gk.length === 2) break; }
+    const team = c => ({ shirt: c, shorts: lum(c) > 0.62 ? '#111827' : '#f1f5f9', socks: c, numColor: lum(c) > 0.62 ? '#111827' : '#ffffff', trim: lum(c) > 0.62 ? '#111827' : 'rgba(255,255,255,0.5)' });
+    const refShirt = used.some(u => lum(u) < 0.2) ? '#facc15' : '#111111';
+    return {
+      A: team(T.A.color), B: team(T.B.color),
+      gkA: { ...team(gk[0] || '#22c55e'), shorts: '#111827', socks: gk[0] || '#22c55e' },
+      gkB: { ...team(gk[1] || '#facc15'), shorts: '#111827', socks: gk[1] || '#facc15' },
+      ref: { shirt: refShirt, shorts: '#111111', socks: '#111111', numColor: '#fff' },
+    };
+  }
+  function agentLook(a) {
+    if (a >= 22) return { ...kits.ref, skin: '#c8956b', hair: '#2b1d14', num: null, boots: '#111111', foot: 'right' };
+    const side = a < 11 ? 'A' : 'B';
+    const slot = a - (side === 'A' ? 0 : 11);
+    const p = TEAMS[side].players[slot];
+    const role = M0.teams[side].players[slot].role;
+    const kit = role === 'GK' ? kits['gk' + side] : kits[side];
+    const lk = looks.get(p.id) || { skin: '#c8956b', hair: '#2b1d14' };
+    const gk = role === 'GK';
+    return { ...kit, skin: lk.skin, hair: lk.hair, num: p.num ?? slot + 1, name: p.name, id: p.id, side, foot: p.foot || 'right',
+      boots: ['#111111', '#f8fafc', '#facc15', '#ef4444', '#22d3ee'][(Number(p.id) || slot) % 5], gloves: gk ? '#f8fafc' : null, longSleeve: gk };
+  }
+  let lookCache = null;
+  const allLooks = () => (lookCache ||= Array.from({ length: 25 }, (_, a) => agentLook(a)));
+
+  // ---------------------------------------------------------------- frame rendering
+  const scratch = Array.from({ length: 26 }, () => ({}));
+  const pj = [0, 0, 0];
+  const smooth = x => x * x * (3 - 2 * x);
+  // Average an agent's position over a short window (steady close-up cameras).
+  function avgPos(c, ag, ct, win = 0.5) {
+    let x = 0, y = 0, n = 0;
+    for (let tt = ct - win; tt <= ct + win; tt += 0.1) { const k = clamp(Math.round(tt * HZ), 0, c.N - 1); x += c.pos[(k * 25 + ag) * 2]; y += c.pos[(k * 25 + ag) * 2 + 1]; n++; }
+    return { x: x / n, y: y / n };
+  }
+  function clipCamera(sc, ct, mode) {
+    const c = sc.clip, f = clamp(ct * HZ, 0, c.N - 1), i = Math.floor(f), j = Math.min(i + 1, c.N - 1), a = f - i;
+    const bx = lerp(c.ball[i * 3], c.ball[j * 3], a), by = lerp(c.ball[i * 3 + 1], c.ball[j * 3 + 1], a);
+    if (mode === 'live') {
+      const m = c.marks;
+      // Celebration: cut to a close camera on the scorer.
+      if (m.goalT != null && m.celebrate && ct > m.goalT + 1.3) {
+        const p = avgPos(c, m.celebrate.scorer, ct, 0.6);
+        return D.camera([p.x + 7.5, p.y + 11.5, 3.9], [p.x, p.y, 1.05], 34);
       }
-      sc.confetti = conf;
-      sc.tilt1 = 0; sc.tiltDur = dur;   // drift back towards kickoff shape during the celebration
-    }
-    const punch = isGoal ? null : outcome === 'save' ? 'SAVE!' : outcome === 'caught' ? 'CLAIMED' : outcome === 'post' ? 'OFF THE POST!' : outcome === 'block' ? 'BLOCKED!' : outcome === 'over' ? 'OVER!' : 'WIDE!';
-    sc.punch = punch ? { text: type === 'penalty_miss' ? (outcome === 'save' ? 'PENALTY SAVED!' : 'PENALTY MISSED!') : punch, t0: tShot - 40 } : null;
-    sc.caption = [{ t0: 120, t1: isGoal ? sc.goalT : dur, text: d.text || '', badge: minuteLabel(d), side, icon: isPen ? 'pen' : null }];
-    sc.banner = isPen ? 'PENALTY' : type === 'corner' ? 'CORNER' : type === 'free_kick' ? 'FREE KICK' : null;
-    sc.text = d.text || '';
-    pushScene(sc);
-    if (isGoal) { st.score = sc.scoreAfter; st.poss = other(side); }
-    else st.poss = outcome === 'save' || outcome === 'caught' || outcome === 'block' ? opp : side;
-  }
-
-  function outroScenes() {
-    const order = ['A', 'B'];
-    const motm = stats?.motm;
-    const motmSide = motm?.side === 'B' ? 'B' : motm?.side === 'A' ? 'A' : null;
-    const sc0 = newScene('motm', 4000, { bug: false, label: 'FT', motm, motmSide, motmIdx: motm ? findPlayer(motmSide || 'A', motm.player) : -1 });
-    sc0.kf = [{ t: 0, x: CX, y: CY }, { t: sc0.dur, x: CX, y: CY }];
-    if (motm) pushScene(sc0);
-    for (const s of order) {
-      const a = analysis[s];
-      if (!a) continue;
-      const sc = newScene('team', 5600, { bug: false, label: 'FT', teamSide: s, an: a, rating: avgRating(s) });
-      sc.kf = [{ t: 0, x: CX, y: CY }, { t: sc.dur, x: CX, y: CY }];
-      pushScene(sc);
-    }
-    const end = newScene('end', 4200, { bug: false, label: 'FT' });
-    end.kf = [{ t: 0, x: CX, y: CY }, { t: end.dur, x: CX, y: CY }];
-    pushScene(end);
-  }
-  function avgRating(side) {
-    const r = ratings?.[side];
-    if (!Array.isArray(r) || !r.length) return null;
-    const v = r.map(x => Number(x.rating)).filter(Number.isFinite);
-    return v.length ? v.reduce((a, b) => a + b, 0) / v.length : null;
-  }
-  function playerRating(side, name) {
-    const r = ratings?.[side];
-    if (!Array.isArray(r)) return null;
-    const n = norm(name);
-    const hit = r.find(x => norm(x.player) === n) || r.find(x => norm(surname(x.player)) === norm(surname(name)));
-    return hit && Number.isFinite(Number(hit.rating)) ? Number(hit.rating) : null;
-  }
-
-  function process(item, index) {
-    if (complete || !item || typeof item !== 'object') return;
-    const kind = item.kind, d = item.data && typeof item.data === 'object' ? item.data : {};
-    try {
-      if (kind === 'meta') { if (!meta) meta = d; ensureKickoff(); return; }
-      if (kind === 'ev') {
-        ensureKickoff();
-        const ev = { ...d, min: Math.max(0, Math.min(130, Number.parseInt(d.min, 10) || 0)), add: Math.max(0, Math.min(15, Number.parseInt(d.add, 10) || 0)), type: String(d.type || 'commentary'), side: d.side === 'A' || d.side === 'B' ? d.side : null, text: String(d.text || '').slice(0, 220) };
-        addEvent(ev, index);
-        return;
+      // Booking: close on the referee and the player.
+      if (m.card && ct > m.card.t - 0.3 && ct < m.card.t + 2.5) {
+        const r = avgPos(c, C.REF, ct, 0.4), o = m.card.agent != null ? avgPos(c, m.card.agent, ct, 0.4) : r;
+        const x = (r.x + o.x) / 2, y = (r.y + o.y) / 2;
+        return D.camera([x + 6, y + 12, 4.4], [x, y, 1.1], 36);
       }
-      if (kind === 'stats') {
-        stats = d;
-        if (st.pendingFT) { const p = st.pendingFT; st.pendingFT = null; breakScene(p.d, 'ft', p.index); }
-        return;
-      }
-      if (kind === 'ratings') { ratings = d; return; }
-      if (kind === 'analysis') { if (d.side === 'A' || d.side === 'B') analysis[d.side] = d; return; }
-      if (kind === 'end') {
-        ensureKickoff();
-        flushPending();
-        if (st.pendingFT) { const p = st.pendingFT; st.pendingFT = null; breakScene(p.d, 'ft', p.index); }
-        else if (!scenes.some(s => s.kind === 'ft')) breakScene({ text: '' }, 'ft', -1);
-        outroScenes();
-        complete = true;
-      }
-    } catch (e) {
-      // Never let a malformed item break the timeline.
-      if (typeof console !== 'undefined') console.warn('[match] skipped item', index, e);
-    }
-  }
-
-  reset();
-
-  function setItems(items) {
-    if (!Array.isArray(items)) return;
-    if (items.length < processed || (processed > 0 && items[0] !== items0[0] && JSON.stringify(items[0]) !== JSON.stringify(items0[0]))) reset();
-    for (let i = processed; i < items.length; i++) process(items[i], i);
-    processed = items.length;
-    items0 = items;
-  }
-
-  // ------------------------------------------------------------------ lookup
-  function sceneIndexAt(t) {
-    let lo = 0, hi = scenes.length - 1;
-    while (lo < hi) { const m = (lo + hi + 1) >> 1; if (scenes[m].start <= t) lo = m; else hi = m - 1; }
-    return lo;
-  }
-  const duration = () => { const s = scenes[scenes.length - 1]; return s ? s.start + s.dur : 0; };
-
-  // Flat, append-only list of what plays when (one entry per item for merged beats).
-  let tl = [], tlScenes = 0, tlOwner = null;
-  const KIND_OF = { intro: 'intro', lineups: 'lineups', kickoff: 'kickoff', ht: 'halftime', ft: 'fulltime', motm: 'outro', team: 'outro', end: 'outro' };
-  function timeline() {
-    if (tlOwner !== scenes) { tl = []; tlScenes = 0; tlOwner = scenes; }
-    for (; tlScenes < scenes.length; tlScenes++) {
-      const sc = scenes[tlScenes];
-      if (sc.kind === 'beat') {
-        for (const c of sc.caption) tl.push({ start: sc.start + c.t0, end: sc.start + c.t1, kind: 'ev', type: c.type || 'commentary', itemIndex: c.index ?? -1, side: c.side === 'A' || c.side === 'B' ? c.side : null, minute: c.badge || sc.label || '' });
-        continue;
-      }
-      const synthetic = KIND_OF[sc.kind];
-      tl.push({
-        start: sc.start, end: sc.start + sc.dur,
-        kind: synthetic || 'ev',
-        type: sc.evType || (synthetic ? sc.kind : null),
-        itemIndex: sc.eventIndex ?? -1,
-        side: sc.side === 'A' || sc.side === 'B' ? sc.side : sc.teamSide || null,
-        minute: sc.kind === 'ht' ? 'HT' : synthetic === 'fulltime' || synthetic === 'outro' ? 'FT' : sc.label || '',
-      });
-    }
-    return tl;
-  }
-  function ftStart() { for (const sc of scenes) if (sc.kind === 'ft') return sc.start; return Infinity; }
-  const scoreAt = (sc, lt) => (lt >= sc.goalT ? sc.scoreAfter : sc.scoreBefore);
-  function clockText(sc, lt) {
-    if (sc.kind === 'ht') return { main: '45:00', extra: 'HT' };
-    if (sc.kind === 'ft' || sc.kind === 'motm' || sc.kind === 'team' || sc.kind === 'end') return { main: '90:00', extra: 'FT' };
-    if (sc.stoppage) return { main: `${sc.min}:00`, extra: `+${sc.stoppage}` };
-    const m = mix(sc.clock0, sc.clock1, seg(lt, 0, sc.dur));
-    const mm = Math.floor(m), ss = Math.floor((m - mm) * 60);
-    return { main: `${String(mm).padStart(2, '0')}:${String(ss).padStart(2, '0')}`, extra: '' };
-  }
-
-  // ------------------------------------------------------------------ drawing: world
-  function camAt(sc, lt) {
-    const c = sc.cam;
-    let x = CX, y = CY, z = 1;
-    if (c) {
-      const pin = smooth(seg(lt, c.in0, c.in1)), pout = easeInOut(seg(lt, c.out0, c.out1));
-      const p = pin * (1 - pout);
-      z = mix(1, c.z, p); x = mix(CX, c.x, p); y = mix(CY, c.y, p);
-    }
-    // keep the view inside the canvas
-    const hw = W / (2 * z), hh = H / (2 * z);
-    x = Math.max(hw, Math.min(W - hw, x)); y = Math.max(hh, Math.min(H - hh, y));
-    let sx = 0, sy = 0;
-    if (sc.kind === 'goal' && lt >= sc.goalT && lt < sc.goalT + 520) {
-      const k = 1 - (lt - sc.goalT) / 520;
-      sx = Math.sin(lt * 0.09) * 7 * k; sy = Math.cos(lt * 0.113) * 5 * k;
-    }
-    CAM.x = x; CAM.y = y; CAM.z = z; CAM.sx = sx; CAM.sy = sy;
-    return CAM;
-  }
-  const CAM = { x: CX, y: CY, z: 1, sx: 0, sy: 0 };
-
-  function drawWorld(ctx, sc, lt, showPlayers = true) {
-    const cam = camAt(sc, lt);
-    ctx.setTransform(cam.z, 0, 0, cam.z, W / 2 - cam.x * cam.z + cam.sx, H / 2 - cam.y * cam.z + cam.sy);
-    ctx.drawImage(pitchLayer(), 0, 0, W, H);
-    if (sc.kind === 'goal') drawNetRipple(ctx, sc, lt);
-    if (showPlayers) {
-      for (const side of ['B', 'A']) {
-        const team = T[side];
-        for (let i = 0; i < 11; i++) {
-          const key = side + i;
-          let alpha = 1;
-          if (sc.off.has(key)) continue;
-          if (sc.offKey === key && lt > sc.offAt) { alpha = 1 - seg(lt, sc.offAt, sc.offAt + 450); if (alpha <= 0) continue; }
-          const p = playerPos(sc, side, i, lt);
-          if (sc.kind === 'kickoff' && p.y < FT - 20) alpha *= seg(p.y, FT - 46, FT - 20);
-          if (alpha < 1) ctx.globalAlpha = alpha;
-          ctx.drawImage(team.players[i].sprite, p.x - 52, p.y - 13);
-          if (alpha < 1) ctx.globalAlpha = 1;
+      let cx = lerp(c.cam[i * 2], c.cam[j * 2], a), z = lerp(c.cam[i * 2 + 1], c.cam[j * 2 + 1], a);
+      // Shot: push in towards the goal so the ball hitting the net is clearly visible.
+      if (m.shot) {
+        const ts = m.shot.t, te = (m.goalT ?? (ts + m.shot.dur)) + 1.1;
+        const w = ct < ts ? smooth(clamp((ct - (ts - 1.1)) / 0.9, 0, 1)) : ct > te ? 1 - smooth(clamp((ct - te) / 0.7, 0, 1)) : 1;
+        if (w > 0) {
+          // Frame the goal mouth itself (the push-in may go right to the end of the pitch).
+          const gx = m.shot.to.x > C.L / 2 ? C.L - 11.5 : 11.5;
+          cx = lerp(cx, gx, w); z = lerp(z, 1.55, w);
         }
       }
+      if (m.foul) {
+        const w = Math.max(0, 1 - Math.abs(ct - m.foul.t) / 1.6);
+        if (w > 0) { cx = lerp(cx, clamp(m.foul.at.x, 21, 84), smooth(w)); z = lerp(z, 1.4, smooth(w)); }
+      }
+      return D.broadcastCam(cx, z);
     }
-    drawBall(ctx, sc, lt);
-    ctx.setTransform(1, 0, 0, 1, 0, 0);
-  }
-
-  function drawBall(ctx, sc, lt) {
-    const b = ballPos(sc, lt);
-    if (sc.kind === 'goal' && lt > sc.dur - 300) return;
-    const h = b.h;
-    ctx.fillStyle = 'rgba(0,0,0,0.35)';
-    ctx.beginPath(); ctx.ellipse(b.x + h * 0.35, b.y + 2 + h * 0.2, 6 + h * 0.05, 3.5, 0, 0, Math.PI * 2); ctx.fill();
-    const r = 5.6 + h * 0.07;
-    ctx.fillStyle = '#ffffff'; ctx.strokeStyle = '#0d1410'; ctx.lineWidth = 1.4;
-    ctx.beginPath(); ctx.arc(b.x, b.y - h, r, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
-    ctx.fillStyle = '#1b2420'; ctx.beginPath(); ctx.arc(b.x - r * 0.2, b.y - h - r * 0.15, r * 0.36, 0, Math.PI * 2); ctx.fill();
-  }
-
-  function drawNetRipple(ctx, sc, lt) {
-    if (lt < sc.goalT || lt > sc.goalT + 1300) return;
-    const p = (lt - sc.goalT) / 1300;
-    const amp = 13 * (1 - p) * Math.abs(Math.sin(p * Math.PI * 4.5));
-    const side = sc.side, gx = goalX(side), dir = dirOf(side);
-    const back = gx + dir * GD;
-    ctx.strokeStyle = `rgba(255,255,255,${0.85 * (1 - p)})`; ctx.lineWidth = 1.4;
-    for (let k = 0; k <= 4; k++) {
-      const off = k * (GD / 4);
-      ctx.beginPath();
-      ctx.moveTo(gx + dir * off, CY - GH);
-      ctx.quadraticCurveTo(gx + dir * (off + amp * (k / 4 + 0.3)), CY, gx + dir * off, CY + GH);
-      ctx.stroke();
+    if (mode === 'goal') {
+      const side = sc.ev.side || 'A', dir = sc.M.dir[side];
+      return D.behindGoalCam(dir > 0 ? C.L : 0, by);
     }
-    ctx.beginPath(); ctx.moveTo(back, CY - GH); ctx.quadraticCurveTo(back + dir * amp * 1.6, CY, back, CY + GH); ctx.stroke();
+    if (mode === 'reverse') return D.reverseCam(bx, by);
+    if (mode === 'close') return D.closeCam(bx, by, 1);
+    const cx = lerp(c.cam[i * 2], c.cam[j * 2], a), z = lerp(c.cam[i * 2 + 1], c.cam[j * 2 + 1], a);
+    return D.broadcastCam(cx, z);
   }
 
-  // ------------------------------------------------------------------ drawing: overlays
-  function drawBug(ctx, sc, lt) {
-    const score = scoreAt(sc, lt);
-    const pulse = sc.kind === 'goal' && lt >= sc.goalT ? 1 + 0.16 * Math.max(0, Math.sin(seg(lt, sc.goalT, sc.goalT + 700) * Math.PI)) : 1;
-    const x = 22, y = 18, h = 40;
-    const A = T.A, B = T.B;
-    const nameF = font(800, 17);
-    const wA = Math.max(46, textW(nameF, A.short) + 22), wB = Math.max(46, textW(nameF, B.short) + 22);
-    const ck = clockText(sc, lt);
-    const wS = 74, wC = ck.extra ? 120 : 86;
-    const total = 8 + wA + wS + wB + 8 + wC;
-    ctx.fillStyle = 'rgba(6,10,8,0.86)'; roundRect(ctx, x, y, total, h, 10); ctx.fill();
-    // team chips
-    ctx.fillStyle = A.css; ctx.fillRect(x + 8, y + 9, 5, h - 18);
-    ctx.fillStyle = B.css; ctx.fillRect(x + 8 + wA + wS + wB - 5, y + 9, 5, h - 18);
-    ctx.font = nameF; ctx.fillStyle = '#fff'; ctx.textBaseline = 'middle'; ctx.textAlign = 'center';
-    ctx.fillText(A.short, x + 8 + wA / 2 + 3, y + h / 2 + 1);
-    ctx.fillText(B.short, x + 8 + wA + wS + wB / 2 - 3, y + h / 2 + 1);
-    // score
-    const sx = x + 8 + wA, scx = sx + wS / 2;
-    ctx.fillStyle = '#f4f7f5'; roundRect(ctx, sx + 4, y + 5, wS - 8, h - 10, 6); ctx.fill();
-    ctx.save(); ctx.translate(scx, y + h / 2 + 1); ctx.scale(pulse, pulse);
-    ctx.fillStyle = '#0b1410'; ctx.font = font(900, 20); ctx.fillText(`${score[0]} – ${score[1]}`, 0, 0);
+  function drawClip(ctx, sc, ct, mode, opts = {}) {
+    const c = sc.clip;
+    ct = clamp(ct, 0, c.dur - 0.001);
+    const cam = clipCamera(sc, ct, mode);
+    const f = ct * HZ, i = Math.min(Math.floor(f), c.N - 1), j = Math.min(i + 1, c.N - 1), a = f - Math.floor(f);
+    D.drawStadium(ctx, cam, ct);
+    D.drawPitch(ctx, cam);
+    // Goals (net ripple after a goal)
+    const goalT = c.marks.goalT, net = c.marks.netAt;
+    for (const gx of [0, C.L]) {
+      let ripple = null;
+      if (goalT != null && ct > goalT && net && Math.abs(net.x - gx) < 1) ripple = { at: net, t: ct - goalT };
+      D.drawGoal(ctx, cam, gx, ripple);
+    }
+    // Agents + ball, depth-sorted
+    const L = allLooks();
+    const items = [];
+    for (let ag = 0; ag < 25; ag++) {
+      const o = (i * 25 + ag), o2 = (j * 25 + ag);
+      const x = lerp(c.pos[o * 2], c.pos[o2 * 2], a), y = lerp(c.pos[o * 2 + 1], c.pos[o2 * 2 + 1], a);
+      if (x < -20) continue;
+      const pi = Math.max(0, i - 2), pj2 = Math.min(c.N - 1, i + 2);
+      const vx = (c.pos[(pj2 * 25 + ag) * 2] - c.pos[(pi * 25 + ag) * 2]) / ((pj2 - pi) / HZ || 1);
+      const vy = (c.pos[(pj2 * 25 + ag) * 2 + 1] - c.pos[(pi * 25 + ag) * 2 + 1]) / ((pj2 - pi) / HZ || 1);
+      const s = scratch[ag];
+      let dh = c.hd[o2] - c.hd[o]; if (dh > Math.PI) dh -= 2 * Math.PI; if (dh < -Math.PI) dh += 2 * Math.PI;
+      const sp = Math.hypot(vx, vy);
+      const k0 = Math.max(0, i - 4), k1 = Math.min(c.N - 1, i + 4);
+      const sp0 = Math.hypot(c.pos[(Math.min(c.N - 1, k0 + 1) * 25 + ag) * 2] - c.pos[(k0 * 25 + ag) * 2], c.pos[(Math.min(c.N - 1, k0 + 1) * 25 + ag) * 2 + 1] - c.pos[(k0 * 25 + ag) * 2 + 1]) * HZ;
+      const sp1 = Math.hypot(c.pos[(k1 * 25 + ag) * 2] - c.pos[(Math.max(0, k1 - 1) * 25 + ag) * 2], c.pos[(k1 * 25 + ag) * 2 + 1] - c.pos[(Math.max(0, k1 - 1) * 25 + ag) * 2 + 1]) * HZ;
+      s.ag = ag; s.idx = ag; s.x = x; s.y = y; s.vx = vx; s.vy = vy; s.v = sp; s.acc = (sp1 - sp0) / ((k1 - k0) / HZ || 1);
+      s.hd = c.hd[o] + dh * a; s.ph = lerp(c.ph[o], c.ph[o2], a);
+      s.st = c.st[o]; s.stT = c.stT[o] + (c.st[o] === c.st[o2] ? a / HZ : 0);
+      D.project(cam, x, y, 0, pj); s.sx = pj[0]; s.sy = pj[1]; s.depth = pj[2];
+      items.push(s);
+    }
+    const ball = scratch[25];
+    ball.ag = -1; ball.x = lerp(c.ball[i * 3], c.ball[j * 3], a); ball.y = lerp(c.ball[i * 3 + 1], c.ball[j * 3 + 1], a); ball.z = lerp(c.ball[i * 3 + 2], c.ball[j * 3 + 2], a);
+    D.project(cam, ball.x, ball.y, 0, pj); ball.depth = pj[2] - 0.3;
+    items.push(ball);
+    items.sort((p, q) => q.depth - p.depth);
+    let carrier = -1, cd = 1.3;
+    for (const s of items) if (s.ag >= 0 && s.ag < 22 && ball.z < 0.6) { const d = Math.hypot(s.x - ball.x, s.y - ball.y); if (d < cd) { cd = d; carrier = s.ag; } }
+    for (const s of items) {
+      if (s.ag < 0) { D.drawBall(ctx, cam, s.x, s.y, s.z, (s.x + s.y) * 1.3); continue; }
+      const k = D.scaleAt(cam, s.x, s.y);
+      if (s.sx < -60 || s.sx > W + 60) continue;
+      s.look = L[s.ag];
+      s.diveY = s.st === C.S.DIVE_L ? -1 : 1;
+      const hp = D.drawRig(ctx, cam, s, ct);
+      s.hx = hp[0]; s.hy = hp[1];
+    }
+    // Name tag over the ball carrier (broadcast style)
+    if (!opts.noTags && carrier >= 0) {
+      const s = items.find(q => q.ag === carrier);
+      const lk = L[carrier];
+      if (s && s.hx != null) D.drawTag(ctx, s.hx, s.hy + 2.05 * D.scaleAt(cam, s.x, s.y) - 6, D.scaleAt(cam, s.x, s.y), `${lk.num ?? ''} ${surname(lk.name)}`.trim(), lk.side === 'A' ? TEAMS.A.color : TEAMS.B.color);
+    }
+    return { cam, items, ball, i };
+  }
+
+  // ---------------------------------------------------------------- HUD
+  function scoreAt(sc, t) {
+    const s = [...(sc.scoreBefore || [0, 0])];
+    if (sc.goalAt != null && t >= sc.goalAt) s[sc.ev.side === 'B' ? 1 : 0]++;
+    return s;
+  }
+  function clockText(sc, ct) {
+    const base = (sc.min - 1) * 60 + 25;
+    let sec = Math.max(0, base + (ct - (sc.climax || 0)));
+    if (sc.min >= 45 && sc.min < 46 || sc.min >= 90) sec = Math.min(sec, sc.min * 60 - 1 + (sc.add ? 59 : 0));
+    const m = Math.floor(sec / 60), s = Math.floor(sec % 60);
+    if (sc.add && (sc.min === 45 || sc.min === 90)) return `${sc.min}:00`;
+    return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+  }
+  function scorebug(ctx, sc, t, ct) {
+    const s = scoreAt(sc, t);
+    const x = 26, y = 22, h = 34;
+    ctx.save();
+    ctx.fillStyle = 'rgba(6,10,8,0.88)';
+    D.roundRect(ctx, x, y, 270, h, 7); ctx.fill();
+    ctx.fillStyle = TEAMS.A.color; ctx.fillRect(x + 8, y + 9, 5, 16);
+    ctx.fillStyle = TEAMS.B.color; ctx.fillRect(x + 160, y + 9, 5, 16);
+    ctx.fillStyle = '#fff'; ctx.textBaseline = 'middle'; ctx.textAlign = 'left';
+    ctx.font = `800 15px ${FONT}`;
+    ctx.fillText(short3(TEAMS.A.name), x + 19, y + h / 2 + 1);
+    ctx.fillText(short3(TEAMS.B.name), x + 171, y + h / 2 + 1);
+    // score box
+    const pulse = sc.goalAt != null && t >= sc.goalAt && t < sc.goalAt + 1200 ? 1 + Math.sin(((t - sc.goalAt) / 1200) * Math.PI) * 0.18 : 1;
+    ctx.save(); ctx.translate(x + 113, y + h / 2);
+    ctx.scale(pulse, pulse);
+    ctx.fillStyle = '#f8fafc'; D.roundRect(ctx, -34, -13, 68, 26, 5); ctx.fill();
+    ctx.fillStyle = '#0b100d'; ctx.font = `900 17px ${FONT}`; ctx.textAlign = 'center';
+    ctx.fillText(`${s[0]} – ${s[1]}`, 0, 1);
     ctx.restore();
-    // clock
-    const cx0 = x + total - wC;
-    ctx.fillStyle = 'rgba(255,255,255,0.08)'; ctx.fillRect(cx0, y + 7, 1, h - 14);
-    ctx.fillStyle = '#e8efe9'; ctx.font = font(800, 16);
-    if (ck.extra) {
-      ctx.textAlign = 'left'; ctx.fillText(ck.main, cx0 + 10, y + h / 2 + 1);
-      const ew = textW(font(800, 12), ck.extra) + 10;
-      ctx.fillStyle = ck.extra === 'HT' || ck.extra === 'FT' ? '#f5b301' : '#e3262f';
-      roundRect(ctx, cx0 + wC - ew - 6, y + 11, ew, 18, 5); ctx.fill();
-      ctx.fillStyle = ck.extra === 'HT' || ck.extra === 'FT' ? '#1a1300' : '#fff'; ctx.font = font(800, 12); ctx.textAlign = 'center';
-      ctx.fillText(ck.extra, cx0 + wC - ew / 2 - 6, y + h / 2 + 1);
-    } else { ctx.textAlign = 'center'; ctx.fillText(ck.main, cx0 + wC / 2, y + h / 2 + 1); }
-    // match progress
-    const m = ck.extra === 'FT' ? 90 : ck.extra === 'HT' ? 45 : sc.stoppage ? sc.min : mix(sc.clock0, sc.clock1, seg(lt, 0, sc.dur));
-    ctx.fillStyle = 'rgba(255,255,255,0.12)'; ctx.fillRect(x + 10, y + h + 4, total - 20, 3);
-    ctx.fillStyle = '#7ee2a8'; ctx.fillRect(x + 10, y + h + 4, (total - 20) * Math.min(1, m / 90), 3);
+    ctx.fillStyle = 'rgba(255,255,255,0.12)'; ctx.fillRect(x + 212, y + 6, 1, h - 12);
+    ctx.fillStyle = '#fff'; ctx.font = `700 15px ${FONT}`; ctx.textAlign = 'left';
+    ctx.fillText(clockText(sc, ct), x + 220, y + h / 2 + 1);
+    if (sc.add && (sc.min === 45 || sc.min === 90)) {
+      ctx.fillStyle = '#16a34a'; D.roundRect(ctx, x + 276, y + 6, 34, 22, 4); ctx.fill();
+      ctx.fillStyle = '#fff'; ctx.font = `800 13px ${FONT}`; ctx.textAlign = 'center'; ctx.fillText(`+${sc.add}`, x + 293, y + 17.5);
+    }
+    // Red cards
+    const reds = built.state ? built.state.cards.filter(c => c.color === 'red') : [];
+    ctx.restore();
   }
-
-  function drawCaption(ctx, sc, lt) {
-    const caps = sc.caption;
-    if (!caps || !caps.length) return;
+  const ICON = { goal: '⚽', shot: '🎯', corner: '⚑', freekick: '◎', penalty: '◉', foul: '✕', yellow: '▮', red: '▮', offside: '⚐', var: 'VAR', injury: '+', kickoff: '▶', flow: '↔', post: '▯', goalkick: '↗', counter: '⚡', ht: '⏸', ft: '⏹' };
+  function lowerThird(ctx, sc, ct) {
+    const caps = sc.clip.marks.captions;
     let cap = null;
-    for (let i = 0; i < caps.length; i++) if (lt >= caps[i].t0 && lt < caps[i].t1) { cap = caps[i]; break; }
-    if (!cap || !cap.text) return;
-    const first = caps[0], last = caps[caps.length - 1];
-    const inP = smooth(seg(lt, first.t0, first.t0 + 220));
-    const outP = seg(lt, last.t1 - 160, last.t1);
-    const alpha = inP * (1 - outP);
-    if (alpha <= 0.01) return;
-    const textIn = caps.length > 1 ? smooth(seg(lt, cap.t0, cap.t0 + 160)) : 1;
-    const bw = 900, bh = 62, bx = (W - bw) / 2, by = H - bh - 16 + (1 - inP) * 24;
-    ctx.globalAlpha = alpha;
-    ctx.fillStyle = 'rgba(6,10,8,0.88)'; roundRect(ctx, bx, by, bw, bh, 12); ctx.fill();
-    const team = cap.side === 'A' || cap.side === 'B' ? T[cap.side] : null;
-    const bc = team ? team.css : '#e8efe9', bink = team ? team.ink : '#0b1410';
-    const badge = cap.badge || '';
-    const bwid = Math.max(70, textW(font(900, 18), badge) + 26);
-    ctx.fillStyle = bc; roundRect(ctx, bx + 8, by + 8, bwid, bh - 16, 8); ctx.fill();
-    ctx.fillStyle = bink; ctx.font = font(900, fitSize(badge, 900, 18, bwid - 12, 11)); ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-    ctx.fillText(badge, bx + 8 + bwid / 2, by + bh / 2 + 1);
-    let tx = bx + 8 + bwid + 16;
-    if (cap.icon) { drawIcon(ctx, cap.icon, tx + 10, by + bh / 2, sc); tx += 30; }
-    const maxW = bx + bw - 18 - tx;
-    const wr = wrap(cap.text, 600, 19, maxW, 2, 12);
-    ctx.globalAlpha = alpha * textIn;
-    ctx.fillStyle = '#f2f6f3'; ctx.font = font(600, wr.size); ctx.textAlign = 'left';
-    const lh = wr.size * 1.22, y0 = by + bh / 2 - ((wr.lines.length - 1) * lh) / 2 + (1 - textIn) * 6;
-    for (let i = 0; i < wr.lines.length; i++) ctx.fillText(wr.lines[i], tx, y0 + i * lh + 1);
-    ctx.globalAlpha = 1;
+    for (const c of caps) if (ct >= c.t && ct < c.t + 3.4) cap = c;
+    if (!cap || !cap.text) return null;
+    const p = clamp((ct - cap.t) / 0.35, 0, 1), q = clamp((cap.t + 3.4 - ct) / 0.35, 0, 1);
+    const alpha = Math.min(p, q), slide = (1 - easeOut(p)) * 30;
+    const w = 860, x = (W - w) / 2, y = H - 92 + slide;
+    ctx.save(); ctx.globalAlpha = alpha;
+    ctx.fillStyle = 'rgba(6,10,8,0.86)'; D.roundRect(ctx, x, y, w, 56, 10); ctx.fill();
+    const side = sc.ev?.side;
+    ctx.fillStyle = side === 'B' ? TEAMS.B.color : side === 'A' ? TEAMS.A.color : '#16a34a';
+    D.roundRect(ctx, x + 10, y + 10, 64, 36, 7); ctx.fill();
+    ctx.fillStyle = lum(ctx.fillStyle) > 0.62 ? '#111' : '#fff';
+    ctx.font = `900 16px ${FONT}`; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText(minuteStr(sc.min, sc.add), x + 42, y + 28.5);
+    if (cap.icon === 'yellow' || cap.icon === 'red') { ctx.fillStyle = cap.icon === 'red' ? '#ef1c1c' : '#ffd400'; ctx.fillRect(x + 88, y + 15, 17, 25); }
+    const tx = cap.icon === 'yellow' || cap.icon === 'red' ? x + 118 : x + 90;
+    const lines = wrap(cap.text, 650, fit(cap.text, 650, 19, w - (tx - x) - 20, 14), w - (tx - x) - 20, 2);
+    ctx.fillStyle = '#f8fafc'; ctx.textAlign = 'left';
+    const fs = fit(lines[0], 650, 19, w - (tx - x) - 20, 14);
+    ctx.font = `650 ${fs}px ${FONT}`;
+    lines.forEach((ln, i) => ctx.fillText(ln, tx, y + 28.5 + (i - (lines.length - 1) / 2) * (fs + 3)));
+    ctx.restore();
+    return cap;
   }
-
-  function drawIcon(ctx, icon, x, y, sc) {
+  function wipe(ctx, p, sc) {
+    // Broadcast stinger: diagonal bands sweeping across.
+    if (p <= 0 || p >= 1) return;
+    const e = easeInOut(p);
     ctx.save();
-    if (icon === 'card') {
-      ctx.fillStyle = sc.cardType === 'yellow' ? '#f5c518' : '#e3262f';
-      ctx.translate(x, y); ctx.rotate(0.18); roundRect(ctx, -7, -10, 14, 20, 2.5); ctx.fill();
-    } else if (icon === 'injury') {
-      ctx.fillStyle = '#ff5d5d'; ctx.fillRect(x - 3, y - 9, 6, 18); ctx.fillRect(x - 9, y - 3, 18, 6);
-    } else if (icon === 'offside') {
-      ctx.strokeStyle = '#e8efe9'; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(x - 6, y + 10); ctx.lineTo(x - 6, y - 10); ctx.stroke();
-      ctx.fillStyle = '#f5b301'; ctx.fillRect(x - 5, y - 10, 13, 9);
-    } else if (icon === 'var') {
-      ctx.strokeStyle = '#8fd3ff'; ctx.lineWidth = 2; roundRect(ctx, x - 10, y - 7, 20, 14, 3); ctx.stroke();
-    } else if (icon === 'whistle') {
-      ctx.fillStyle = '#c9d4ce'; ctx.beginPath(); ctx.arc(x - 2, y + 2, 6, 0, Math.PI * 2); ctx.fill(); ctx.fillRect(x - 2, y - 4, 12, 5);
-    } else if (icon === 'pen') {
-      ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.arc(x, y, 6, 0, Math.PI * 2); ctx.fill();
-      ctx.fillStyle = '#0b1410'; ctx.beginPath(); ctx.arc(x, y, 2.4, 0, Math.PI * 2); ctx.fill();
+    const cols = [TEAMS.A.color, '#f8fafc', TEAMS.B.color];
+    cols.forEach((col, i) => {
+      const off = (e * 2.4 - 0.7 - i * 0.12) * (W + 600);
+      ctx.fillStyle = col;
+      ctx.beginPath(); ctx.moveTo(off - 300, 0); ctx.lineTo(off + 120, 0); ctx.lineTo(off - 180, H); ctx.lineTo(off - 600, H); ctx.closePath(); ctx.fill();
+    });
+    if (p > 0.35 && p < 0.7 && sc) {
+      ctx.fillStyle = '#0b100d'; ctx.font = `italic 900 54px ${FONT}`; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.globalAlpha = Math.sin(((p - 0.35) / 0.35) * Math.PI);
+      ctx.fillText(minuteStr(sc.min, sc.add), W / 2, H / 2);
     }
     ctx.restore();
   }
-
-  function drawPunch(ctx, text, t, color, size = 96, y = H * 0.42, hold = 900) {
-    if (t < 0 || t > hold + 300) return;
-    const s = 0.35 + 0.65 * spr(SPR.pop, t);
-    const a = (1 - seg(t, hold, hold + 300));
-    const fs = fitSize(text, 900, size, W - 160, 30, true);
+  function photoCircle(ctx, id, x, y, r, ring) {
+    const img = photos.get(id);
     ctx.save();
-    ctx.globalAlpha = a;
-    ctx.translate(W / 2, y); ctx.scale(s, s); ctx.rotate(-0.04);
-    ctx.font = font(900, fs, true); ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-    ctx.lineJoin = 'round';
-    ctx.fillStyle = 'rgba(0,0,0,0.45)'; ctx.fillText(text, 5, 7);
-    ctx.lineWidth = Math.max(4, fs * 0.08); ctx.strokeStyle = color; ctx.strokeText(text, 0, 0);
-    ctx.fillStyle = '#ffffff'; ctx.fillText(text, 0, 0);
+    ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.closePath();
+    ctx.fillStyle = '#1d2722'; ctx.fill();
+    if (img && img.width) {
+      ctx.clip();
+      const s = (r * 2) / img.width;
+      ctx.drawImage(img, x - r, y - r * 0.9, r * 2, img.height * s);
+    }
+    ctx.restore();
+    if (ring) { ctx.strokeStyle = ring; ctx.lineWidth = Math.max(2, r * 0.08); ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.stroke(); }
+  }
+  const playerByName = (side, name) => {
+    const a = C.findAgent(M0, side, name);
+    return a == null ? null : TEAMS[side].players[a - (side === 'A' ? 0 : 11)];
+  };
+
+  function goalGraphic(ctx, sc, ct) {
+    const g = sc.clip.marks.goalT;
+    if (g == null || ct < g + 0.25) return;
+    const p = (ct - g - 0.25);
+    if (p > 4.4) return;
+    const side = sc.ev.side, col = TEAMS[side].color;
+    const disallowed = sc.ev.outcome === 'disallowed';
+    if (disallowed && p > 1.3) return;
+    ctx.save();
+    const inP = clamp(p / 0.45, 0, 1), outP = clamp((4.4 - p) / 0.4, 0, 1);
+    ctx.globalAlpha = Math.min(1, outP);
+    // Big kinetic GOAL
+    const letters = 'GOAL'.split('');
+    ctx.font = `italic 950 150px ${FONT}`;
+    ctx.textBaseline = 'middle'; ctx.textAlign = 'center';
+    const tw = ctx.measureText('GOAL').width;
+    let x = W / 2 - tw / 2;
+    letters.forEach((ch, i) => {
+      const lp = clamp((p - i * 0.07) / 0.4, 0, 1);
+      const s = lp < 1 ? backOut(lp) : 1;
+      const w = ctx.measureText(ch).width;
+      ctx.save();
+      ctx.translate(x + w / 2, H / 2 - 40 + (1 - lp) * 60);
+      ctx.scale(s, s);
+      ctx.lineWidth = 14; ctx.strokeStyle = '#ffffff'; ctx.lineJoin = 'round'; ctx.strokeText(ch, 0, 0);
+      ctx.fillStyle = col; ctx.fillText(ch, 0, 0);
+      ctx.restore();
+      x += w;
+    });
+    if (disallowed) { ctx.restore(); return; }
+    // Scorer card
+    const pl = playerByName(side, sc.ev.ownGoal ? null : sc.ev.player);
+    const cp = clamp((p - 0.5) / 0.5, 0, 1);
+    const cy = H - 150 + (1 - easeOut(cp)) * 80;
+    ctx.globalAlpha = Math.min(outP, cp);
+    ctx.fillStyle = 'rgba(6,10,8,0.9)'; D.roundRect(ctx, W / 2 - 300, cy, 600, 96, 14); ctx.fill();
+    ctx.fillStyle = col; ctx.fillRect(W / 2 - 300, cy, 8, 96);
+    if (pl) photoCircle(ctx, pl.id, W / 2 - 240, cy + 48, 38, col);
+    ctx.fillStyle = '#fff'; ctx.textAlign = 'left';
+    const nm = sc.ev.ownGoal ? `${sc.ev.og} (own goal)` : sc.ev.player || '';
+    ctx.font = `900 ${fit(nm, 900, 30, 400, 16)}px ${FONT}`; ctx.fillText(nm, W / 2 - 186, cy + 36);
+    ctx.fillStyle = '#cfdad4'; ctx.font = `600 16px ${FONT}`;
+    const sub = `${minuteStr(sc.min, sc.add)} · ${sc.ev.technique === 'penalty' ? 'Penalty' : sc.ev.body === 'head' ? 'Header' : sc.ev.technique === 'free_kick' ? 'Free kick' : (sc.ev.body === 'left' ? 'Left foot' : 'Right foot')}${sc.ev.assist ? ` · assist ${sc.ev.assist}` : ''}`;
+    ctx.fillText(sub, W / 2 - 186, cy + 66);
+    ctx.restore();
+  }
+  function cardGraphic(ctx, sc, ct) {
+    const cm = sc.clip.marks.card;
+    if (!cm || ct < cm.t || ct > cm.t + 3.2) return;
+    const p = ct - cm.t;
+    const side = sc.ev.side === 'A' ? 'B' : 'A';
+    const pl = playerByName(side, sc.ev.offender);
+    const a = Math.min(clamp(p / 0.3, 0, 1), clamp((3.2 - p) / 0.3, 0, 1));
+    ctx.save(); ctx.globalAlpha = a;
+    const x = W - 400, y = 90;
+    ctx.fillStyle = 'rgba(6,10,8,0.9)'; D.roundRect(ctx, x, y, 360, 90, 12); ctx.fill();
+    const flip = Math.abs(Math.cos(clamp(p / 0.5, 0, 1) * Math.PI)) ;
+    ctx.save(); ctx.translate(x + 40, y + 45); ctx.scale(Math.max(0.15, 1 - flip * 0.85 * (p < 0.5 ? 1 : 0)), 1);
+    ctx.fillStyle = cm.color === 'red' ? '#ef1c1c' : '#ffd400'; D.roundRect(ctx, -15, -24, 30, 46, 4); ctx.fill();
+    if (cm.second) { ctx.fillStyle = '#ffd400'; D.roundRect(ctx, -22, -28, 30, 46, 4); ctx.fill(); ctx.fillStyle = '#ef1c1c'; D.roundRect(ctx, -10, -20, 30, 46, 4); ctx.fill(); }
+    ctx.restore();
+    if (pl) photoCircle(ctx, pl.id, x + 105, y + 45, 30, TEAMS[side].color);
+    ctx.fillStyle = '#fff'; ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+    const nm = sc.ev.offender || '';
+    ctx.font = `800 ${fit(nm, 800, 21, 210, 12)}px ${FONT}`; ctx.fillText(nm, x + 146, y + 34);
+    ctx.fillStyle = cm.color === 'red' ? '#fca5a5' : '#fde68a'; ctx.font = `700 14px ${FONT}`;
+    ctx.fillText(cm.second ? 'Second yellow — sent off' : cm.color === 'red' ? 'Sent off' : 'Booked', x + 146, y + 60);
     ctx.restore();
   }
 
-  function drawBanner(ctx, text, t, side) {
-    if (!text || t < 0 || t > 1300) return;
-    const team = T[side];
-    const p = smooth(seg(t, 0, 260)) * (1 - seg(t, 1050, 1300));
-    const w = textW(font(900, 22), text) + 44;
-    const x = W - 22 - w * p, y = 18;
+  // ---------------------------------------------------------------- freeze-frame analysis image
+  function drawFreeze(ctx, sc, local) {
+    const c = sc.clip, at = sc.at;
+    const { cam, items } = drawClip(ctx, sc, at, 'live', { noTags: true });
+    const p = clamp(local / 600, 0, 1);
+    // Dim + vignette
+    ctx.fillStyle = `rgba(0,0,0,${0.38 * p})`; ctx.fillRect(0, 0, W, H);
+    const side = sc.ev.side || 'A', col = TEAMS[side].color, opp = side === 'A' ? 'B' : 'A';
+    const agentAt = ag => { const s = items.find(q => q.ag === ag); return s ? { x: s.x, y: s.y } : null; };
     ctx.globalAlpha = p;
-    ctx.fillStyle = team ? team.css : '#fff'; roundRect(ctx, x, y, w, 40, 10); ctx.fill();
-    ctx.fillStyle = team ? team.ink : '#0b1410'; ctx.font = font(900, 22); ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-    ctx.fillText(text, x + w / 2, y + 21);
+    // Passing move into this moment
+    const passes = c.marks.passes.filter(ps => ps.t0 <= at + 0.05 && ps.t0 >= at - 9).slice(-4);
+    passes.forEach((ps, i) => {
+      const from = posAt(c, ps.from, ps.t0), to = ps.target;
+      if (from) D.worldArrow(ctx, cam, from, to, i === passes.length - 1 ? '#ffd34d' : 'rgba(255,255,255,0.85)', { dashed: i !== passes.length - 1, loft: ps.loft ? Math.min(ps.loft, 6) * 0.35 : 0, width: i === passes.length - 1 ? 4 : 3 });
+    });
+    const shot = c.marks.shot;
+    if (shot && sc.ev.type === 'shot') D.worldArrow(ctx, cam, posAt(c, shot.agent, shot.t) || shot.from, shot.to, '#ff4d57', { width: 4.5 });
+    // Offside line
+    const off = c.marks.offside;
+    if (off) {
+      const tk = Math.round(off.t * HZ);
+      const defSide = off.sideAtt === 'A' ? 'B' : 'A';
+      const lineX = defSide === (sc.M.dir.A > 0 ? 'B' : 'A') ? c.offX[tk * 2 + 1] : c.offX[tk * 2];
+      D.worldLine(ctx, cam, lineX, -1, lineX, C.WD + 1, '#38bdf8', 3.5);
+      const rp = posAt(c, off.runner, off.t);
+      if (rp) { D.worldLine(ctx, cam, rp.x, -1, rp.x, C.WD + 1, '#ff4d57', 3, [10, 7]); }
+      D.project(cam, lineX, 2, 0, pj);
+      ctx.fillStyle = '#38bdf8'; ctx.font = `800 13px ${FONT}`; ctx.textAlign = 'center';
+      ctx.fillText('LAST DEFENDER', pj[0], pj[1] - 8);
+    }
+    // Spotlights + chips on the protagonists
+    const prot = (c.info.protagonists || []).filter(a => a != null).slice(0, 3);
+    prot.forEach((ag, i) => {
+      const s = items.find(q => q.ag === ag); if (!s) return;
+      const sCol = ag < 11 ? TEAMS.A.color : TEAMS.B.color;
+      D.spotlight(ctx, cam, s.x, s.y, i === 0 ? '#ffd34d' : '#ffffff', Math.sin(local / 180) * 0.5 + 0.5);
+      const lk = allLooks()[ag];
+      // redraw the figure over the dim
+      const k = D.scaleAt(cam, s.x, s.y);
+      D.drawRig(ctx, cam, s, at);
+      chip(ctx, s.sx, s.sy - 2.2 * k - 46, lk, sCol, i === 0);
+    });
     ctx.globalAlpha = 1;
+    // Title banner
+    const bp = clamp((local - 250) / 450, 0, 1);
+    const bx = 30 - (1 - easeOut(bp)) * 360;
+    ctx.save(); ctx.globalAlpha = bp;
+    ctx.fillStyle = 'rgba(6,10,8,0.92)'; D.roundRect(ctx, bx, H - 132, 620, 100, 12); ctx.fill();
+    ctx.fillStyle = col; ctx.fillRect(bx, H - 132, 7, 100);
+    ctx.fillStyle = '#9fb7a8'; ctx.font = `800 12px ${FONT}`; ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
+    ctx.fillText(`HOW IT HAPPENED · ${minuteStr(sc.min, sc.add)}`, bx + 22, H - 106);
+    const title = momentTitle(sc.ev, sc.ev.type === 'shot' ? 'shot' : sc.ev.type);
+    ctx.fillStyle = '#fff'; ctx.font = `900 ${fit(title, 900, 26, 570, 15)}px ${FONT}`; ctx.fillText(title, bx + 22, H - 78);
+    const desc = wrap(sc.ev.text || '', 500, 15, 570, 2);
+    ctx.fillStyle = '#cfdad4'; ctx.font = `500 15px ${FONT}`;
+    desc.forEach((ln, i) => ctx.fillText(ln, bx + 22, H - 55 + i * 19));
+    ctx.restore();
+    // Tactical mini-map (top-down)
+    miniMap(ctx, sc, at, W - 330, 26, 300, 196, bp);
+    // "ANALYSIS" bug
+    ctx.save(); ctx.globalAlpha = p;
+    ctx.fillStyle = '#ffd34d'; D.roundRect(ctx, 26, 24, 118, 30, 6); ctx.fill();
+    ctx.fillStyle = '#111'; ctx.font = `900 14px ${FONT}`; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText('◉ ANALYSIS', 85, 39.5);
+    ctx.restore();
   }
-
-  function dim(ctx, a) { if (a <= 0) return; ctx.fillStyle = `rgba(4,8,6,${a})`; ctx.fillRect(0, 0, W, H); }
-
-  function photo(side, i) { const p = T[side]?.players[i]; return p ? p.photo : null; }
-  function drawPhoto(ctx, side, i, x, y, d) {
-    const ph = photo(side, i);
-    if (ph) ctx.drawImage(ph, x - d / 2, y - d / 2, d, d);
+  function posAt(c, ag, t) {
+    if (ag == null || ag < 0) return null;
+    const k = clamp(Math.round(t * HZ), 0, c.N - 1);
+    return { x: c.pos[(k * 25 + ag) * 2], y: c.pos[(k * 25 + ag) * 2 + 1] };
   }
-
-  // ------------------------------------------------------------------ scenes
-  function drawIntro(ctx, sc, lt) {
-    ctx.drawImage(pitchLayer(), 0, 0, W, H);
-    ctx.fillStyle = dimGrad(ctx); ctx.fillRect(0, 0, W, H);
-    const A = T.A, B = T.B;
-    const pa = spr(SPR.soft, lt - 80), pb = spr(SPR.soft, lt - 220);
-    // colour slabs
+  function chip(ctx, x, y, lk, col, main) {
     ctx.save();
-    ctx.fillStyle = A.css; ctx.globalAlpha = 0.95;
-    ctx.beginPath(); const ax = mix(-W * 0.6, 0, pa);
-    ctx.moveTo(ax, 0); ctx.lineTo(ax + W * 0.47, 0); ctx.lineTo(ax + W * 0.41, H); ctx.lineTo(ax, H); ctx.fill();
-    ctx.fillStyle = B.css;
-    ctx.beginPath(); const bx = mix(W * 0.6, 0, pb);
-    ctx.moveTo(W + bx, 0); ctx.lineTo(W + bx - W * 0.41, 0); ctx.lineTo(W + bx - W * 0.47, H); ctx.lineTo(W + bx, H); ctx.fill();
+    ctx.font = `800 13px ${FONT}`;
+    const name = surname(lk.name);
+    const w = ctx.measureText(name).width + 50;
+    ctx.fillStyle = 'rgba(6,10,8,0.92)'; D.roundRect(ctx, x - w / 2, y - 17, w, 34, 17); ctx.fill();
+    ctx.strokeStyle = main ? '#ffd34d' : col; ctx.lineWidth = 2; ctx.stroke();
+    photoCircle(ctx, lk.id, x - w / 2 + 17, y, 13, col);
+    ctx.fillStyle = '#fff'; ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+    ctx.fillText(name, x - w / 2 + 36, y + 1);
     ctx.restore();
-    // darken slabs slightly for legibility
-    ctx.fillStyle = 'rgba(0,0,0,0.18)'; ctx.fillRect(0, 0, W, H);
-    // names
-    const nA = fitSize(A.name.toLocaleUpperCase('tr'), 900, 64, W * 0.36, 22, true);
-    const nB = fitSize(B.name.toLocaleUpperCase('tr'), 900, 64, W * 0.36, 22, true);
-    const ta = spr(SPR.pop, lt - 300), tb = spr(SPR.pop, lt - 420);
-    ctx.textBaseline = 'middle';
-    ctx.save(); ctx.globalAlpha = c01(ta); ctx.translate(mix(-200, 0, ta), 0);
-    ctx.font = font(900, nA, true); ctx.textAlign = 'left'; ctx.fillStyle = A.ink; ctx.fillText(A.name.toLocaleUpperCase('tr'), 70, H / 2 - 18);
-    ctx.font = font(700, 18); ctx.globalAlpha *= 0.85; ctx.fillText(`${A.formation} · ${A.short}`, 72, H / 2 + 30);
+  }
+  function miniMap(ctx, sc, at, x, y, w, h, alpha) {
+    const c = sc.clip;
+    ctx.save(); ctx.globalAlpha = alpha;
+    ctx.fillStyle = 'rgba(6,10,8,0.9)'; D.roundRect(ctx, x - 8, y - 8, w + 16, h + 34, 10); ctx.fill();
+    ctx.fillStyle = '#1f6b37'; ctx.fillRect(x, y, w, h);
+    const sx = v => x + (v / C.L) * w, sy = v => y + (v / C.WD) * h;
+    ctx.strokeStyle = 'rgba(255,255,255,0.7)'; ctx.lineWidth = 1;
+    ctx.strokeRect(x, y, w, h);
+    ctx.beginPath(); ctx.moveTo(sx(C.L / 2), y); ctx.lineTo(sx(C.L / 2), y + h); ctx.stroke();
+    ctx.beginPath(); ctx.arc(sx(C.L / 2), sy(C.WD / 2), (9.15 / C.L) * w, 0, Math.PI * 2); ctx.stroke();
+    ctx.strokeRect(x, sy(13.84), (16.5 / C.L) * w, (40.32 / C.WD) * h);
+    ctx.strokeRect(sx(C.L - 16.5), sy(13.84), (16.5 / C.L) * w, (40.32 / C.WD) * h);
+    const passes = c.marks.passes.filter(ps => ps.t0 <= at + 0.05).slice(-5);
+    passes.forEach((ps, i) => {
+      const f = posAt(c, ps.from, ps.t0); if (!f) return;
+      ctx.strokeStyle = i === passes.length - 1 ? '#ffd34d' : 'rgba(255,255,255,0.8)'; ctx.lineWidth = 1.6;
+      ctx.setLineDash(i === passes.length - 1 ? [] : [4, 3]);
+      ctx.beginPath(); ctx.moveTo(sx(f.x), sy(f.y)); ctx.lineTo(sx(ps.target.x), sy(ps.target.y)); ctx.stroke();
+    });
+    ctx.setLineDash([]);
+    if (c.marks.shot && sc.ev.type === 'shot') {
+      const f = posAt(c, c.marks.shot.agent, c.marks.shot.t) || c.marks.shot.from;
+      ctx.strokeStyle = '#ff4d57'; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.moveTo(sx(f.x), sy(f.y)); ctx.lineTo(sx(c.marks.shot.to.x), sy(c.marks.shot.to.y)); ctx.stroke();
+    }
+    const k = clamp(Math.round(at * HZ), 0, c.N - 1);
+    for (let ag = 0; ag < 22; ag++) {
+      const px = c.pos[(k * 25 + ag) * 2], py = c.pos[(k * 25 + ag) * 2 + 1];
+      if (px < -10) continue;
+      const lk = allLooks()[ag];
+      ctx.fillStyle = lk.shirt; ctx.beginPath(); ctx.arc(sx(px), sy(py), 4.2, 0, Math.PI * 2); ctx.fill();
+      ctx.strokeStyle = 'rgba(0,0,0,0.6)'; ctx.lineWidth = 1; ctx.stroke();
+    }
+    ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.arc(sx(c.ball[k * 3]), sy(c.ball[k * 3 + 1]), 2.6, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = '#9fb7a8'; ctx.font = `700 11px ${FONT}`; ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+    ctx.fillText('THE MOVE · top-down', x, y + h + 13);
     ctx.restore();
-    ctx.save(); ctx.globalAlpha = c01(tb); ctx.translate(mix(200, 0, tb), 0);
-    ctx.font = font(900, nB, true); ctx.textAlign = 'right'; ctx.fillStyle = B.ink; ctx.fillText(B.name.toLocaleUpperCase('tr'), W - 70, H / 2 - 18);
-    ctx.font = font(700, 18); ctx.globalAlpha *= 0.85; ctx.fillText(`${B.short} · ${B.formation}`, W - 72, H / 2 + 30);
+  }
+
+  // ---------------------------------------------------------------- full-screen cards
+  function panel(ctx, x, y, w, h, alpha = 0.9) { ctx.fillStyle = `rgba(6,10,8,${alpha})`; D.roundRect(ctx, x, y, w, h, 16); ctx.fill(); }
+  function dimBackdrop(ctx, t) {
+    const walk = built.scenes[0]?.clip;
+    if (walk) drawClip(ctx, { clip: walk, ev: {}, M: C.withHalf(M0, 1) }, 0.5 + (t / 1000) % 6, 'broadcast', { noTags: true });
+    else { ctx.fillStyle = '#0b1220'; ctx.fillRect(0, 0, W, H); }
+    ctx.fillStyle = 'rgba(3,6,5,0.72)'; ctx.fillRect(0, 0, W, H);
+  }
+  function drawIntro(ctx, sc, local) {
+    const walk = sc.clip;
+    // Slow camera pan across the line-up.
+    const camX = lerp(36, 69, easeInOut(clamp(local / sc.dur, 0, 1)));
+    const fake = { ...walk, cam: walk.cam.map((v, i) => (i % 2 === 0 ? camX : 1.08)) };
+    drawClip(ctx, { clip: fake, ev: {}, M: C.withHalf(M0, 1) }, 1 + local / 1000, 'broadcast', { noTags: true });
+    const p = clamp((local - 400) / 700, 0, 1);
+    ctx.fillStyle = `rgba(0,0,0,${0.35 * p})`; ctx.fillRect(0, 0, W, H);
+    ctx.save(); ctx.globalAlpha = p;
+    const y = 120;
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillStyle = '#9fb7a8'; ctx.font = `800 15px ${FONT}`;
+    ctx.fillText('SÜPER LIG MIX · DRAFT DUEL · NEUTRAL GROUND', W / 2, y - 50);
+    const a = TEAMS.A.name, b = TEAMS.B.name;
+    const s = Math.min(fit(a, 900, 58, 470, 24, true), fit(b, 900, 58, 470, 24, true));
+    ctx.font = `italic 900 ${s}px ${FONT}`;
+    const ax = W / 2 - 60 - (1 - easeOut(p)) * 200, bxx = W / 2 + 60 + (1 - easeOut(p)) * 200;
+    ctx.textAlign = 'right'; ctx.fillStyle = '#fff'; ctx.fillText(a, ax, y);
+    ctx.textAlign = 'left'; ctx.fillText(b, bxx, y);
+    ctx.fillStyle = TEAMS.A.color; ctx.fillRect(ax - ctx.measureText(a).width, y + s * 0.55, ctx.measureText(a).width, 6);
+    ctx.fillStyle = TEAMS.B.color; ctx.fillRect(bxx, y + s * 0.55, ctx.measureText(b).width, 6);
+    ctx.textAlign = 'center'; ctx.fillStyle = '#ffd34d'; ctx.font = `italic 900 30px ${FONT}`; ctx.fillText('vs', W / 2, y + 2);
+    const sub = [meta?.referee && `Referee: ${meta.referee}`, meta?.weather].filter(Boolean).join(' · ');
+    ctx.fillStyle = '#cfdad4'; ctx.font = `600 16px ${FONT}`; ctx.fillText(sub || 'Simulated by GPT-6.1 Sol', W / 2, y + 66);
+    if (meta?.headline) {
+      const hp = clamp((local - 1500) / 700, 0, 1);
+      ctx.globalAlpha = hp;
+      const lines = wrap(meta.headline, 700, 20, 820, 2);
+      ctx.fillStyle = '#fff'; ctx.font = `italic 700 20px ${FONT}`;
+      lines.forEach((ln, i) => ctx.fillText(ln, W / 2, H - 120 + i * 26));
+    }
     ctx.restore();
-    // VS badge
-    const v = spr(SPR.bouncy, lt - 700);
-    if (v > 0) {
-      ctx.save(); ctx.translate(W / 2, H / 2 - 4); ctx.scale(v, v); ctx.rotate((1 - v) * -0.6);
-      ctx.fillStyle = '#0b1410'; ctx.beginPath(); ctx.arc(0, 0, 58, 0, Math.PI * 2); ctx.fill();
-      ctx.lineWidth = 5; ctx.strokeStyle = '#fff'; ctx.stroke();
-      ctx.fillStyle = '#fff'; ctx.font = font(900, 46, true); ctx.textAlign = 'center'; ctx.fillText('VS', -2, 2);
+  }
+  function drawLineup(ctx, sc, local) {
+    dimBackdrop(ctx, sc.start + local);
+    const side = sc.side, T = TEAMS[side], col = T.color;
+    const p = clamp(local / 500, 0, 1), out = clamp((sc.dur - local) / 400, 0, 1);
+    ctx.save(); ctx.globalAlpha = Math.min(p, out);
+    // Header
+    ctx.fillStyle = col; ctx.fillRect(60, 56, 8, 56);
+    ctx.fillStyle = '#9fb7a8'; ctx.font = `800 14px ${FONT}`; ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
+    ctx.fillText(`STARTING XI · ${T.formation}`, 84, 74);
+    ctx.fillStyle = '#fff'; ctx.font = `italic 900 ${fit(T.name, 900, 40, 560, 20, true)}px ${FONT}`; ctx.fillText(T.name, 84, 108);
+    const sty = meta?.styles?.[side];
+    if (sty) {
+      const chips = [sty.style, sty.line && `${sty.line} line`, sty.press && `${sty.press} press`, sty.tempo && `${sty.tempo} tempo`, sty.width].filter(Boolean).slice(0, 5);
+      let cx = 84;
+      ctx.font = `700 13px ${FONT}`;
+      for (const ch of chips) { const w = ctx.measureText(ch).width + 20; ctx.fillStyle = 'rgba(255,255,255,0.1)'; D.roundRect(ctx, cx, 122, w, 26, 13); ctx.fill(); ctx.fillStyle = '#e5efe9'; ctx.fillText(ch, cx + 10, 140); cx += w + 8; }
+    }
+    // Formation board with photos (vertical pitch)
+    const bx = 760, by = 70, bw = 380, bh = 590;
+    ctx.fillStyle = '#1f6b37'; D.roundRect(ctx, bx, by, bw, bh, 10); ctx.fill();
+    ctx.strokeStyle = 'rgba(255,255,255,0.5)'; ctx.lineWidth = 1.5;
+    ctx.strokeRect(bx + 10, by + 10, bw - 20, bh - 20);
+    ctx.beginPath(); ctx.moveTo(bx + 10, by + bh / 2); ctx.lineTo(bx + bw - 10, by + bh / 2); ctx.stroke();
+    ctx.beginPath(); ctx.arc(bx + bw / 2, by + bh / 2, 46, 0, Math.PI * 2); ctx.stroke();
+    ctx.strokeRect(bx + bw / 2 - 90, by + bh - 10 - 80, 180, 80); ctx.strokeRect(bx + bw / 2 - 90, by + 10, 180, 80);
+    const f = M0.teams[side];
+    T.players.forEach((pl, i) => {
+      const [, fx, fy] = FORMATIONS_OF(f.formation)[i];
+      const x = bx + 10 + (fx / 100) * (bw - 20), y = by + 10 + (fy / 100) * (bh - 20) - 16;
+      const ap = clamp((local - 300 - i * 70) / 380, 0, 1);
+      ctx.save(); ctx.globalAlpha = Math.min(p, out) * ap;
+      photoCircle(ctx, pl.id, x, y, 24 * (0.6 + 0.4 * backOut(ap)), col);
+      ctx.fillStyle = '#fff'; ctx.font = `800 12px ${FONT}`; ctx.textAlign = 'center'; ctx.textBaseline = 'alphabetic';
+      ctx.fillText(surname(pl.name), x, y + 40);
       ctx.restore();
-    }
-    // top/bottom labels
-    const l1 = smooth(seg(lt, 900, 1400));
-    ctx.globalAlpha = l1; ctx.textAlign = 'center';
-    ctx.fillStyle = '#fff'; ctx.font = font(800, 15);
-    ctx.fillText('S Ü P E R   L I G   M I X', W / 2, 62);
-    const chip = 'NEUTRAL GROUND · NO HOME ADVANTAGE';
-    const cw = textW(font(800, 14), chip) + 34;
-    ctx.fillStyle = 'rgba(6,10,8,0.82)'; roundRect(ctx, W / 2 - cw / 2, H - 120 + (1 - l1) * 16, cw, 34, 17); ctx.fill();
-    ctx.fillStyle = '#7ee2a8'; ctx.font = font(800, 14); ctx.fillText(chip, W / 2, H - 102 + (1 - l1) * 16);
-    ctx.globalAlpha = smooth(seg(lt, 1300, 1800));
-    ctx.fillStyle = 'rgba(255,255,255,0.8)'; ctx.font = font(600, 14);
-    ctx.fillText('Simulated by GPT-6 Luna', W / 2, H - 60);
-    ctx.globalAlpha = 1;
-    dim(ctx, seg(lt, sc.dur - 320, sc.dur) * 0.9);
-  }
-
-  function drawLineups(ctx, sc, lt) {
-    ctx.drawImage(pitchLayer(), 0, 0, W, H);
-    ctx.fillStyle = dimGrad(ctx); ctx.fillRect(0, 0, W, H);
-    dim(ctx, 0.9 * (1 - seg(lt, 0, 300)));
-    const colW = 520, gap = 80, x0 = (W - colW * 2 - gap) / 2;
-    ctx.textBaseline = 'middle';
-    const head = smooth(seg(lt, 0, 420));
-    ctx.globalAlpha = head; ctx.fillStyle = '#fff'; ctx.textAlign = 'center'; ctx.font = font(900, 26, true);
-    ctx.fillText('STARTING LINE-UPS', W / 2, 42 - (1 - head) * 10);
-    ctx.globalAlpha = 1;
-    for (const [s, ci] of [['A', 0], ['B', 1]]) {
-      const team = T[s], cx = x0 + ci * (colW + gap);
-      const hp = spr(SPR.soft, lt - 120 - ci * 120);
-      ctx.save(); ctx.globalAlpha = c01(hp); ctx.translate((ci ? 1 : -1) * (1 - hp) * 60, 0);
-      ctx.fillStyle = team.css; roundRect(ctx, cx, 72, colW, 50, 10); ctx.fill();
-      ctx.fillStyle = team.ink; ctx.textAlign = 'left';
-      const nm = team.name.toLocaleUpperCase('tr');
-      ctx.font = font(900, fitSize(nm, 900, 24, colW - 130, 12, true), true); ctx.fillText(nm, cx + 18, 98);
-      ctx.font = font(800, 15); ctx.textAlign = 'right'; ctx.fillText(team.formation, cx + colW - 16, 98);
+    });
+    // List
+    T.players.forEach((pl, i) => {
+      const role = f.players[i].role;
+      const ap = clamp((local - 200 - i * 55) / 300, 0, 1);
+      const y = 186 + i * 42;
+      ctx.save(); ctx.globalAlpha = Math.min(p, out) * ap; ctx.translate((1 - easeOut(ap)) * -40, 0);
+      ctx.fillStyle = 'rgba(255,255,255,0.06)'; D.roundRect(ctx, 84, y - 16, 600, 36, 8); ctx.fill();
+      ctx.fillStyle = col; D.roundRect(ctx, 92, y - 11, 38, 26, 6); ctx.fill();
+      ctx.fillStyle = lum(col) > 0.62 ? '#111' : '#fff'; ctx.font = `900 15px ${FONT}`; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillText(String(pl.num ?? i + 1), 111, y + 2);
+      ctx.fillStyle = '#9fb7a8'; ctx.font = `800 12px ${FONT}`; ctx.fillText(role, 160, y + 2);
+      ctx.fillStyle = '#fff'; ctx.textAlign = 'left'; ctx.font = `700 16px ${FONT}`; ctx.fillText(pl.name, 190, y + 2);
+      ctx.fillStyle = '#9fb7a8'; ctx.textAlign = 'right'; ctx.font = `600 13px ${FONT}`; ctx.fillText(pl.club || pl.value || '', 672, y + 2);
       ctx.restore();
-      for (let i = 0; i < 11; i++) {
-        const p = team.players[i];
-        const rp = spr(SPR.soft, lt - 300 - i * 70 - ci * 40);
-        if (rp <= 0.001) continue;
-        const y = 140 + i * 46;
-        ctx.save(); ctx.globalAlpha = c01(rp * 1.2); ctx.translate((ci ? 1 : -1) * (1 - rp) * 80, 0);
-        ctx.fillStyle = i % 2 ? 'rgba(255,255,255,0.04)' : 'rgba(255,255,255,0.08)'; roundRect(ctx, cx, y, colW, 42, 8); ctx.fill();
-        drawPhoto(ctx, s, i, cx + 24, y + 21, 34);
-        ctx.fillStyle = '#f2f6f3'; ctx.textAlign = 'left';
-        ctx.font = font(700, fitSize(p.name, 700, 17, colW - 140, 11)); ctx.fillText(p.name, cx + 50, y + 22);
-        const rw = textW(font(800, 12), p.role) + 16;
-        ctx.fillStyle = 'rgba(255,255,255,0.12)'; roundRect(ctx, cx + colW - rw - 12, y + 11, rw, 20, 5); ctx.fill();
-        ctx.fillStyle = '#cfe1d6'; ctx.font = font(800, 12); ctx.textAlign = 'center'; ctx.fillText(p.role, cx + colW - rw / 2 - 12, y + 21.5);
-        ctx.restore();
-      }
-    }
-    dim(ctx, seg(lt, sc.dur - 300, sc.dur) * 0.8);
-  }
-
-  function drawKickoff(ctx, sc, lt) {
-    drawWorld(ctx, sc, lt);
-    dim(ctx, 0.8 * (1 - seg(lt, 0, 380)));
-    // coin toss
-    const cp = seg(lt, 350, 1700);
-    if (lt > 300 && lt < 2050) {
-      const kickA = sc.kick === 'A';
-      const ang = easeOut(cp) * (Math.PI * 8 + (kickA ? 0 : Math.PI));
-      const sy = Math.cos(ang);
-      const lift = Math.sin(cp * Math.PI) * 110;
-      const a = 1 - seg(lt, 1800, 2050);
-      ctx.save(); ctx.globalAlpha = a; ctx.translate(CX, CY - 40 - lift); ctx.scale(1, Math.max(0.06, Math.abs(sy)));
-      ctx.fillStyle = sy >= 0 ? T.A.css : T.B.css; ctx.beginPath(); ctx.arc(0, 0, 34, 0, Math.PI * 2); ctx.fill();
-      ctx.lineWidth = 5; ctx.strokeStyle = '#f5d76e'; ctx.stroke();
-      ctx.fillStyle = sy >= 0 ? T.A.ink : T.B.ink; ctx.font = font(900, 18); ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-      ctx.fillText(sy >= 0 ? T.A.short : T.B.short, 0, 1);
-      ctx.restore();
-    }
-    drawBug(ctx, sc, lt);
-    drawPunch(ctx, 'KICK-OFF!', lt - 1750, T[sc.kick].css, 92, H * 0.4, 1150);
-    if (lt > 1800) {
-      const p = smooth(seg(lt, 1800, 2200));
-      const sub = [sc.referee && `Referee: ${sc.referee}`, sc.weather].filter(Boolean).join(' · ');
-      if (sub) {
-        ctx.globalAlpha = p * (1 - seg(lt, sc.dur - 250, sc.dur));
-        ctx.font = font(700, 15); ctx.fillStyle = '#fff'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-        ctx.fillText(sub, W / 2, H * 0.4 + 70);
-        ctx.globalAlpha = 1;
-      }
-    }
-    drawCaption(ctx, sc, lt);
-  }
-
-  function drawPitchScene(ctx, sc, lt) {
-    drawWorld(ctx, sc, lt);
-    if (sc.kind === 'var') drawVar(ctx, sc, lt);
-    drawBug(ctx, sc, lt);
-    if (sc.banner) drawBanner(ctx, sc.banner, lt - 60, sc.side);
-    if (sc.kind === 'card') drawCard(ctx, sc, lt);
-    if (sc.kind === 'offside') drawPunch(ctx, 'OFFSIDE', lt - 820, '#f5b301', 70, H * 0.4, 520);
-    if (sc.kind === 'injury') drawPunch(ctx, 'INJURY', lt - 200, '#ff5d5d', 60, H * 0.4, 800);
-    if (sc.kind === 'second') drawPunch(ctx, 'SECOND HALF', lt - 150, T[sc.kick].css, 84, H * 0.42, 1150);
-    if (sc.punch) drawPunch(ctx, sc.punch.text, lt - sc.punch.t0, sc.side ? T[sc.side].css : '#fff', sc.punch.text.length > 10 ? 80 : 104);
-    drawCaption(ctx, sc, lt);
-  }
-
-  function drawVar(ctx, sc, lt) {
-    const a = smooth(seg(lt, 0, 250)) * (1 - seg(lt, sc.dur - 250, sc.dur));
-    ctx.globalAlpha = a;
-    dim(ctx, 0.45);
-    ctx.fillStyle = 'rgba(143,211,255,0.08)';
-    for (let y = (lt * 0.12) % 8; y < H; y += 8) ctx.fillRect(0, y, W, 2);
-    const by = (lt * 0.35) % (H + 160) - 80;
-    ctx.fillStyle = 'rgba(143,211,255,0.16)'; ctx.fillRect(0, by, W, 60);
-    const bw = 340, bh = 92, bx = (W - bw) / 2, bY = H * 0.36;
-    ctx.fillStyle = 'rgba(6,14,20,0.92)'; roundRect(ctx, bx, bY, bw, bh, 14); ctx.fill();
-    ctx.strokeStyle = '#8fd3ff'; ctx.lineWidth = 2; ctx.stroke();
-    ctx.fillStyle = '#8fd3ff'; ctx.font = font(900, 34, true); ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-    ctx.fillText('VAR CHECK', W / 2 + 18, bY + bh / 2);
-    ctx.save(); ctx.translate(bx + 40, bY + bh / 2); ctx.rotate(lt * 0.008);
-    ctx.lineWidth = 4; ctx.beginPath(); ctx.arc(0, 0, 14, 0, Math.PI * 1.4); ctx.stroke();
+    });
     ctx.restore();
-    ctx.globalAlpha = 1;
   }
-
-  function drawCard(ctx, sc, lt) {
-    const a = smooth(seg(lt, 0, 200)) * (1 - seg(lt, sc.dur - 260, sc.dur));
-    ctx.globalAlpha = a; dim(ctx, 0.34); ctx.globalAlpha = 1;
-    const second = sc.cardType === 'second_yellow';
-    const flip1 = seg(lt, 80, 560);
-    let sx = Math.abs(Math.cos((1 - backOut(flip1)) * Math.PI / 2 * 1.0));
-    let color = sc.cardType === 'yellow' ? '#f5c518' : '#e3262f';
-    if (second) {
-      const f2 = seg(lt, 1050, 1450);
-      if (lt < 1050) color = '#f5c518';
-      else { const ang = f2 * Math.PI; sx = Math.abs(Math.cos(ang)); color = f2 < 0.5 ? '#f5c518' : '#e3262f'; }
-    }
-    const lift = spr(SPR.pop, lt - 60);
+  function drawToss(ctx, sc, local) {
+    dimBackdrop(ctx, sc.start + local);
+    const p = local / sc.dur;
+    const flip = Math.min(1, p * 1.6);
+    const ang = flip * Math.PI * 7;
+    const side = sc.side;
     ctx.save();
-    ctx.globalAlpha = a;
-    ctx.translate(W / 2, H * 0.4 + (1 - lift) * 60); ctx.rotate(0.12 * (1 - lift) - 0.06);
-    ctx.scale(Math.max(0.04, sx), 1);
-    ctx.fillStyle = 'rgba(0,0,0,0.35)'; roundRect(ctx, -58, -78, 124, 170, 12); ctx.fill();
-    ctx.fillStyle = color; roundRect(ctx, -64, -86, 124, 170, 12); ctx.fill();
-    ctx.fillStyle = 'rgba(255,255,255,0.22)'; roundRect(ctx, -56, -78, 40, 154, 8); ctx.fill();
+    ctx.translate(W / 2, H / 2 - 40 - Math.sin(flip * Math.PI) * 120);
+    ctx.scale(1, Math.abs(Math.cos(ang)) * 0.9 + 0.1);
+    ctx.fillStyle = '#e5c158'; ctx.beginPath(); ctx.arc(0, 0, 56, 0, Math.PI * 2); ctx.fill();
+    ctx.strokeStyle = '#b8902c'; ctx.lineWidth = 5; ctx.stroke();
     ctx.restore();
-    const team = T[sc.side];
-    const label = sc.cardType === 'yellow' ? 'YELLOW CARD' : second ? 'SECOND YELLOW · SENT OFF' : 'RED CARD · SENT OFF';
-    const p = smooth(seg(lt, 350, 700));
-    ctx.globalAlpha = a * p; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-    ctx.fillStyle = '#fff'; const nm = sc.player || team.name;
-    ctx.font = font(900, fitSize(nm, 900, 34, 640, 16)); ctx.fillText(nm, W / 2, H * 0.4 + 128);
-    ctx.font = font(800, 15); ctx.fillStyle = color === '#f5c518' ? '#f5c518' : '#ff7b7b'; ctx.fillText(label, W / 2, H * 0.4 + 160);
-    ctx.globalAlpha = 1;
-  }
-
-  function drawGoal(ctx, sc, lt) {
-    drawWorld(ctx, sc, lt);
-    const team = T[sc.side];
-    const g0 = sc.goalT;
-    if (lt >= g0) {
-      // flash
-      const f = 1 - seg(lt, g0, g0 + 380);
-      if (f > 0) { ctx.fillStyle = `rgba(255,255,255,${0.62 * f})`; ctx.fillRect(0, 0, W, H); }
-      // colour wash
-      const wash = smooth(seg(lt, g0 + 120, g0 + 500)) * (1 - seg(lt, sc.dur - 500, sc.dur));
-      if (wash > 0) { ctx.fillStyle = rgba(team.color, 0.28 * wash); ctx.fillRect(0, 0, W, H); dim(ctx, 0.25 * wash); }
-      drawConfetti(ctx, sc, lt - g0, team);
+    if (p > 0.62) {
+      ctx.save(); ctx.globalAlpha = clamp((p - 0.62) / 0.15, 0, 1);
+      ctx.textAlign = 'center'; ctx.fillStyle = '#fff'; ctx.font = `900 30px ${FONT}`;
+      ctx.fillText(`${TEAMS[side].name} win the toss and kick off`, W / 2, H / 2 + 110);
+      ctx.restore();
     }
-    drawBug(ctx, sc, lt);
-    if (sc.banner) drawBanner(ctx, sc.banner, lt - 60, sc.side);
-    drawCaption(ctx, sc, lt);
-    if (lt >= g0 + 120) drawGoalText(ctx, sc, lt - g0 - 120, team);
-    if (lt >= g0 + 520) drawScorer(ctx, sc, lt - g0 - 520, team);
   }
-
-  function drawGoalText(ctx, sc, t, team) {
-    const word = sc.type === 'own_goal' ? 'OWN GOAL!' : 'GOAL!';
-    const fs = sc.type === 'own_goal' ? 128 : 176;
-    const f = font(900, fs, true);
-    const total = textW(f, word);
-    const fade = 1 - seg(t, sc.dur - sc.goalT - 120 - 900, sc.dur - sc.goalT - 120 - 500);
-    if (fade <= 0) return;
-    let x = W / 2 - total / 2;
-    ctx.font = f; ctx.textBaseline = 'alphabetic'; ctx.textAlign = 'left'; ctx.lineJoin = 'round';
-    const baseY = H * 0.47;
-    const fill = team.light ? '#ffffff' : team.css, stroke = team.light ? '#0b1410' : '#ffffff';
-    for (let i = 0; i < word.length; i++) {
-      const ch = word[i];
-      const cw = textW(f, ch);
-      const s = spr(SPR.bouncy, t - i * 55);
-      if (s > 0.001) {
-        const wob = Math.sin((t - i * 55) * 0.012) * 4 * (1 - seg(t, 0, 1400));
-        ctx.save();
-        ctx.globalAlpha = fade;
-        ctx.translate(x + cw / 2, baseY - (1 - s) * 80 + wob); ctx.scale(s, s); ctx.rotate(-0.05);
-        ctx.fillStyle = 'rgba(0,0,0,0.42)'; ctx.fillText(ch, -cw / 2 + 7, 9);
-        ctx.lineWidth = 12; ctx.strokeStyle = stroke; ctx.strokeText(ch, -cw / 2, 0);
-        ctx.fillStyle = fill; ctx.fillText(ch, -cw / 2, 0);
-        ctx.restore();
-      }
-      x += cw;
-    }
-    ctx.textBaseline = 'middle';
+  function statRows(ctx, rows, x, y, w) {
+    rows.forEach(([label, a, b, fmt], i) => {
+      const yy = y + i * 44;
+      const tot = (Number(a) + Number(b)) || 1;
+      ctx.fillStyle = '#fff'; ctx.font = `800 18px ${FONT}`; ctx.textBaseline = 'middle';
+      ctx.textAlign = 'left'; ctx.fillText(fmt ? fmt(a) : String(a), x, yy);
+      ctx.textAlign = 'right'; ctx.fillText(fmt ? fmt(b) : String(b), x + w, yy);
+      ctx.textAlign = 'center'; ctx.fillStyle = '#9fb7a8'; ctx.font = `700 13px ${FONT}`; ctx.fillText(label.toUpperCase(), x + w / 2, yy);
+      const bw = (w - 20) / 2;
+      ctx.fillStyle = 'rgba(255,255,255,0.1)'; ctx.fillRect(x, yy + 14, w, 6);
+      ctx.fillStyle = TEAMS.A.color; ctx.fillRect(x + w / 2 - (Number(a) / tot) * (w / 2), yy + 14, (Number(a) / tot) * (w / 2), 6);
+      ctx.fillStyle = TEAMS.B.color; ctx.fillRect(x + w / 2, yy + 14, (Number(b) / tot) * (w / 2), 6);
+    });
   }
-
-  function drawScorer(ctx, sc, t, team) {
-    const p = spr(SPR.soft, t);
-    const fade = 1 - seg(t, sc.dur - sc.goalT - 520 - 600, sc.dur - sc.goalT - 520 - 250);
-    if (fade <= 0) return;
-    const bw = 620, bh = 96, bx = (W - bw) / 2, by = H - bh - 26 + (1 - p) * 140;
-    ctx.save(); ctx.globalAlpha = fade * c01(p * 1.3);
-    ctx.fillStyle = 'rgba(6,10,8,0.92)'; roundRect(ctx, bx, by, bw, bh, 16); ctx.fill();
-    ctx.fillStyle = team.css; roundRect(ctx, bx, by, 10, bh, 5); ctx.fill();
-    const isOG = sc.type === 'own_goal';
-    const pSide = isOG ? other(sc.side) : sc.side, pIdx = isOG ? sc.ogDef : sc.shooter;
-    drawPhoto(ctx, pSide, pIdx, bx + 62, by + bh / 2, 72);
-    const name = isOG ? (sc.player || T[pSide].players[pIdx]?.name || '') : (sc.player || T[sc.side].players[sc.shooter]?.name || '');
-    ctx.textAlign = 'left'; ctx.textBaseline = 'middle'; ctx.fillStyle = '#fff';
-    ctx.font = font(900, fitSize(name.toLocaleUpperCase('tr'), 900, 28, bw - 150, 14)); ctx.fillText(name.toLocaleUpperCase('tr'), bx + 112, by + 36);
-    const line2 = [sc.label, sc.type === 'penalty_goal' ? 'Penalty' : isOG ? 'Own goal' : null, !isOG && sc.assist ? `Assist: ${sc.assist}` : null].filter(Boolean).join('  ·  ');
-    ctx.font = font(700, fitSize(line2, 700, 16, bw - 150, 11)); ctx.fillStyle = '#b9cbbf'; ctx.fillText(line2, bx + 112, by + 66);
+  function scoreHeader(ctx, title, score, y) {
+    ctx.textAlign = 'center'; ctx.textBaseline = 'alphabetic';
+    ctx.fillStyle = '#ffd34d'; ctx.font = `900 16px ${FONT}`; ctx.fillText(title, W / 2, y);
+    const s = 34;
+    ctx.fillStyle = '#fff'; ctx.font = `italic 900 ${Math.min(fit(TEAMS.A.name, 900, s, 380, 16, true), fit(TEAMS.B.name, 900, s, 380, 16, true))}px ${FONT}`;
+    ctx.textAlign = 'right'; ctx.fillText(TEAMS.A.name, W / 2 - 90, y + 52);
+    ctx.textAlign = 'left'; ctx.fillText(TEAMS.B.name, W / 2 + 90, y + 52);
+    ctx.textAlign = 'center'; ctx.font = `900 54px ${FONT}`; ctx.fillText(`${score[0]}–${score[1]}`, W / 2, y + 58);
+    ctx.fillStyle = TEAMS.A.color; ctx.fillRect(W / 2 - 90 - 60, y + 66, 60, 5);
+    ctx.fillStyle = TEAMS.B.color; ctx.fillRect(W / 2 + 90, y + 66, 60, 5);
+  }
+  function scorers(ctx, goals, y) {
+    ctx.font = `600 14px ${FONT}`; ctx.fillStyle = '#cfdad4'; ctx.textBaseline = 'alphabetic';
+    const A = goals.filter(g => g.side === 'A').map(g => `${surname(g.name)} ${g.min}${g.pen ? ' (p)' : ''}`).join(', ');
+    const B = goals.filter(g => g.side === 'B').map(g => `${surname(g.name)} ${g.min}${g.pen ? ' (p)' : ''}`).join(', ');
+    ctx.textAlign = 'right'; ctx.fillText(A ? `⚽ ${A}` : '', W / 2 - 90, y);
+    ctx.textAlign = 'left'; ctx.fillText(B ? `⚽ ${B}` : '', W / 2 + 90, y);
+  }
+  function drawHT(ctx, sc, local) {
+    dimBackdrop(ctx, sc.start + local);
+    const p = clamp(local / 500, 0, 1), out = clamp((sc.dur - local) / 400, 0, 1);
+    ctx.save(); ctx.globalAlpha = Math.min(p, out);
+    panel(ctx, 200, 60, 880, 600);
+    scoreHeader(ctx, 'HALF-TIME', sc.score, 110);
+    scorers(ctx, sc.goals, 210);
+    const s = sc.stats;
+    statRows(ctx, [['Shots', s.shots[0], s.shots[1]], ['On target', s.onT[0], s.onT[1]], ['Corners', s.corners[0], s.corners[1]], ['Fouls', s.fouls[0], s.fouls[1]], ['Offsides', s.offsides[0], s.offsides[1]], ['Yellow cards', s.yellow[0], s.yellow[1]], ['Red cards', s.red[0], s.red[1]]], 300, 270, 680);
     ctx.restore();
   }
-
-  const CONF_COLORS = ['#ffffff', '#f5d76e'];
-  function drawConfetti(ctx, sc, t, team) {
-    const c = sc.confetti; if (!c || t < 0 || t > 3600) return;
-    const tt = t / 1000;
-    const fade = 1 - seg(t, 2600, 3600);
-    ctx.globalAlpha = fade;
-    for (let k = 0; k < c.length; k += 6) {
-      const y = c[k + 1] + c[k + 2] * tt + 60 * tt * tt;
-      if (y > H + 20) continue;
-      const x = c[k] + c[k + 3] * tt + Math.sin(tt * 3 + c[k + 4]) * 18;
-      const rot = c[k + 4] + tt * 5;
-      ctx.fillStyle = c[k + 5] === 0 ? team.css : CONF_COLORS[c[k + 5] - 1];
-      const cs = Math.cos(rot), sn = Math.sin(rot);
-      ctx.setTransform(cs, sn, -sn * 0.6, cs * 0.6, x, y);
-      ctx.fillRect(-5, -3, 10, 6);
+  function drawSwitch(ctx, sc, local) {
+    dimBackdrop(ctx, sc.start + local);
+    const p = easeInOut(clamp(local / 1800, 0, 1));
+    const cx = W / 2, cy = H / 2 + 10, pw = 520, ph = 300;
+    ctx.save();
+    ctx.fillStyle = '#1f6b37'; D.roundRect(ctx, cx - pw / 2, cy - ph / 2, pw, ph, 10); ctx.fill();
+    ctx.strokeStyle = 'rgba(255,255,255,0.6)'; ctx.lineWidth = 2; ctx.strokeRect(cx - pw / 2 + 10, cy - ph / 2 + 10, pw - 20, ph - 20);
+    ctx.beginPath(); ctx.moveTo(cx, cy - ph / 2 + 10); ctx.lineTo(cx, cy + ph / 2 - 10); ctx.stroke();
+    // Team blocks swap halves
+    const ax = lerp(cx - pw / 4, cx + pw / 4, p), bxx = lerp(cx + pw / 4, cx - pw / 4, p);
+    const arc = Math.sin(p * Math.PI) * 60;
+    for (const [x, col, name, dy] of [[ax, TEAMS.A.color, TEAMS.A.name, -arc], [bxx, TEAMS.B.color, TEAMS.B.name, arc]]) {
+      ctx.fillStyle = col; ctx.beginPath(); ctx.arc(x, cy + dy, 34, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = lum(col) > 0.62 ? '#111' : '#fff'; ctx.font = `900 16px ${FONT}`; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillText(short3(name), x, cy + dy + 1);
     }
-    ctx.setTransform(1, 0, 0, 1, 0, 0);
-    ctx.globalAlpha = 1;
-  }
-
-  function drawBreak(ctx, sc, lt) {
-    drawWorld(ctx, sc, lt);
-    const a = smooth(seg(lt, 200, 700)) * (1 - seg(lt, sc.dur - 300, sc.dur));
-    dim(ctx, 0.62 * a);
-    drawBug(ctx, sc, lt);
-    const sc2 = sc.scoreAfter;
-    const isFT = sc.kind === 'ft';
-    const s = sc.stats && isFT;
-    const bw = 680, bh = s ? 420 : 210, bx = (W - bw) / 2, by = (H - bh) / 2 + (s ? 10 : -10);
-    const pop = spr(SPR.soft, lt - 250);
-    ctx.save(); ctx.globalAlpha = c01(pop) * a; ctx.translate(0, (1 - pop) * 40);
-    ctx.fillStyle = 'rgba(8,13,10,0.95)'; roundRect(ctx, bx, by, bw, bh, 18); ctx.fill();
-    ctx.strokeStyle = 'rgba(255,255,255,0.1)'; ctx.lineWidth = 1; ctx.stroke();
-    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-    ctx.fillStyle = '#f5b301'; ctx.font = font(900, 18); ctx.fillText(isFT ? 'FULL-TIME' : 'HALF-TIME', W / 2, by + 34);
-    // score line
-    const A = T.A, B = T.B;
-    ctx.font = font(900, 64); ctx.fillStyle = '#fff'; ctx.fillText(`${sc2[0]}  –  ${sc2[1]}`, W / 2, by + 100);
-    ctx.font = font(800, fitSize(A.name, 800, 22, 200, 12)); ctx.textAlign = 'right'; ctx.fillText(A.name, W / 2 - 112, by + 100);
-    ctx.font = font(800, fitSize(B.name, 800, 22, 200, 12)); ctx.textAlign = 'left'; ctx.fillText(B.name, W / 2 + 112, by + 100);
-    ctx.fillStyle = A.css; ctx.fillRect(bx + 24, by + 84, 6, 32);
-    ctx.fillStyle = B.css; ctx.fillRect(bx + bw - 30, by + 84, 6, 32);
-    if (s) {
-      const st2 = sc.stats;
-      const rows = [
-        ['Possession', st2.possession, '%'], ['Shots', st2.shots], ['On target', st2.on_target], ['xG', st2.xg, '', 1],
-        ['Corners', st2.corners], ['Fouls', st2.fouls], ['Cards', [num(st2.yellow, 0) + num(st2.red, 0), num(st2.yellow, 1) + num(st2.red, 1)]],
-      ];
-      let y = by + 160;
-      rows.forEach(([label, v, unit = '', dec = 0], k) => {
-        if (!Array.isArray(v)) return;
-        const a0 = num(v, 0), b0 = num(v, 1);
-        const gp = smooth(seg(lt, 600 + k * 90, 1300 + k * 90));
-        ctx.fillStyle = '#cfe1d6'; ctx.font = font(700, 14); ctx.textAlign = 'center'; ctx.fillText(label, W / 2, y);
-        ctx.font = font(900, 17); ctx.fillStyle = '#fff';
-        ctx.textAlign = 'left'; ctx.fillText(fmtNum(a0, dec) + unit, bx + 34, y);
-        ctx.textAlign = 'right'; ctx.fillText(fmtNum(b0, dec) + unit, bx + bw - 34, y);
-        const barW = bw - 68, half = barW / 2, yb = y + 15;
-        ctx.fillStyle = 'rgba(255,255,255,0.08)'; ctx.fillRect(bx + 34, yb, barW, 6);
-        const mx = Math.max(a0, b0) || 1;
-        const wa = half * (a0 / mx) * gp, wb = half * (b0 / mx) * gp;
-        ctx.fillStyle = A.css; ctx.fillRect(bx + 34 + half - wa, yb, wa, 6);
-        ctx.fillStyle = B.css; ctx.fillRect(bx + 34 + half + 2, yb, wb, 6);
-        y += 36;
-      });
-    } else if (sc.text) {
-      const wr = wrap(sc.text, 600, 16, bw - 80, 2, 11);
-      ctx.fillStyle = '#b9cbbf'; ctx.font = font(600, wr.size); ctx.textAlign = 'center';
-      wr.lines.forEach((ln, k) => ctx.fillText(ln, W / 2, by + 150 + k * wr.size * 1.3));
-    }
+    ctx.fillStyle = '#fff'; ctx.font = `900 30px ${FONT}`; ctx.textAlign = 'center';
+    ctx.fillText('SIDES SWITCH FOR THE SECOND HALF', cx, cy - ph / 2 - 40);
     ctx.restore();
   }
-  const num = (arr, i) => { const v = Number(Array.isArray(arr) ? arr[i] : 0); return Number.isFinite(v) ? v : 0; };
-  const fmtNum = (v, dec) => (dec ? v.toFixed(dec) : String(Math.round(v)));
-
-  function outroBg(ctx, sc, lt) {
-    ctx.drawImage(pitchLayer(), 0, 0, W, H);
-    ctx.fillStyle = dimGrad(ctx); ctx.fillRect(0, 0, W, H);
-  }
-
-  function drawMotm(ctx, sc, lt) {
-    outroBg(ctx, sc, lt);
-    const m = sc.motm || {};
-    const side = sc.motmSide || 'A', team = T[side];
-    const p = spr(SPR.soft, lt - 100);
-    const a = 1 - seg(lt, sc.dur - 320, sc.dur);
-    ctx.save(); ctx.globalAlpha = a;
-    ctx.fillStyle = rgba(team.color, 0.22 * c01(p)); ctx.fillRect(0, 0, W, H);
-    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-    ctx.fillStyle = '#f5d76e'; ctx.font = font(900, 20); ctx.globalAlpha = a * c01(p);
-    ctx.fillText('★  MAN OF THE MATCH  ★', W / 2, 92);
-    const ps = spr(SPR.bouncy, lt - 250);
-    ctx.save(); ctx.translate(W / 2, 236); ctx.scale(ps, ps);
-    ctx.fillStyle = '#f5d76e'; ctx.beginPath(); ctx.arc(0, 0, 98, 0, Math.PI * 2); ctx.fill();
-    if (sc.motmIdx >= 0) drawPhoto(ctx, side, sc.motmIdx, 0, 0, 184);
-    else { ctx.fillStyle = team.css; ctx.beginPath(); ctx.arc(0, 0, 92, 0, Math.PI * 2); ctx.fill(); }
-    ctx.restore();
-    const name = String(m.player || '').toLocaleUpperCase('tr');
-    const np = smooth(seg(lt, 500, 900));
-    ctx.globalAlpha = a * np; ctx.fillStyle = '#fff';
-    ctx.font = font(900, fitSize(name, 900, 46, W - 200, 18, true), true); ctx.fillText(name, W / 2, 380 + (1 - np) * 14);
-    const rating = playerRating(side, m.player);
-    const chip = `${team.name}${rating != null ? `  ·  ${rating.toFixed(1)}` : ''}`;
-    const cw = textW(font(800, 16), chip) + 36;
-    ctx.fillStyle = team.css; roundRect(ctx, W / 2 - cw / 2, 414, cw, 34, 17); ctx.fill();
-    ctx.fillStyle = team.ink; ctx.font = font(800, 16); ctx.fillText(chip, W / 2, 432);
-    const rp = smooth(seg(lt, 800, 1250));
-    ctx.globalAlpha = a * rp;
-    const wr = wrap(m.reason || '', 600, 20, 820, 3, 12);
-    ctx.fillStyle = '#d6e3db'; ctx.font = font(600, wr.size);
-    wr.lines.forEach((ln, k) => ctx.fillText(ln, W / 2, 500 + k * wr.size * 1.35));
+  function drawFT(ctx, sc, local) {
+    dimBackdrop(ctx, sc.start + local);
+    const p = clamp(local / 500, 0, 1), out = clamp((sc.dur - local) / 400, 0, 1);
+    ctx.save(); ctx.globalAlpha = Math.min(p, out);
+    panel(ctx, 180, 40, 920, 640);
+    scoreHeader(ctx, 'FULL TIME', sc.score, 92);
+    scorers(ctx, sc.goals, 192);
+    const s = stats, e = sc.ev;
+    const pick = (k, alt) => (Array.isArray(s?.[k]) ? s[k] : alt);
+    const rows = [
+      ['Possession', ...pick('possession', [50, 50]), v => `${Math.round(v)}%`],
+      ['Shots', ...pick('shots', e.shots)], ['On target', ...pick('on_target', e.onT)],
+      ['xG', ...pick('xg', [0, 0]), v => Number(v).toFixed(2)],
+      ['Corners', ...pick('corners', e.corners)], ['Fouls', ...pick('fouls', e.fouls)],
+      ['Offsides', ...pick('offsides', e.offsides)], ['Cards', e.yellow[0] + e.red[0], e.yellow[1] + e.red[1]],
+    ];
+    statRows(ctx, rows, 280, 240, 720);
     ctx.restore();
   }
-
-  function drawTeam(ctx, sc, lt) {
-    outroBg(ctx, sc, lt);
-    const s = sc.teamSide, team = T[s], an = sc.an || {};
-    const a = 1 - seg(lt, sc.dur - 320, sc.dur);
-    const p = spr(SPR.soft, lt - 60);
-    ctx.save(); ctx.globalAlpha = a;
-    // left kit band
-    ctx.fillStyle = team.css; ctx.fillRect(0, 0, mix(0, 16, c01(p)), H);
-    ctx.fillStyle = rgba(team.color, 0.14); ctx.fillRect(0, 0, W, H);
-    ctx.textBaseline = 'middle'; ctx.textAlign = 'left';
-    const head = team.name.toLocaleUpperCase('tr');
-    ctx.globalAlpha = a * c01(p);
-    ctx.fillStyle = '#fff'; ctx.font = font(900, fitSize(head, 900, 40, 760, 18, true), true); ctx.fillText(head, 70 - (1 - p) * 40, 74);
-    if (sc.rating != null) {
-      const r = sc.rating.toFixed(1);
-      ctx.fillStyle = team.css; roundRect(ctx, W - 200, 46, 130, 56, 12); ctx.fill();
-      ctx.fillStyle = team.ink; ctx.font = font(900, 30); ctx.textAlign = 'center'; ctx.fillText(r, W - 135, 72);
-      ctx.font = font(700, 11); ctx.fillText('AVG RATING', W - 135, 94);
-      ctx.textAlign = 'left';
-    }
-    // plays like
-    const pl = spr(SPR.pop, lt - 350);
-    ctx.globalAlpha = a * c01(pl);
-    ctx.fillStyle = '#9fb7a8'; ctx.font = font(800, 15); ctx.fillText('PLAYS LIKE', 70, 136);
-    const club = String(an.resembles?.club || '—');
-    ctx.save(); ctx.translate(70, 184); ctx.scale(0.8 + 0.2 * pl, 0.8 + 0.2 * pl);
-    ctx.fillStyle = '#fff'; ctx.font = font(900, fitSize(club, 900, 54, 780, 20, true), true); ctx.fillText(club, 0, 0);
+  function drawMotm(ctx, sc, local) {
+    dimBackdrop(ctx, sc.start + local);
+    const m = stats?.motm; if (!m) return;
+    const side = m.side === 'B' ? 'B' : 'A';
+    const pl = playerByName(side, m.player);
+    const p = clamp(local / 600, 0, 1), out = clamp((sc.dur - local) / 400, 0, 1);
+    ctx.save(); ctx.globalAlpha = Math.min(p, out);
+    const r = 150 * (0.7 + 0.3 * backOut(p));
+    if (pl) photoCircle(ctx, pl.id, 360, H / 2, r, TEAMS[side].color);
+    ctx.fillStyle = '#ffd34d'; ctx.font = `900 18px ${FONT}`; ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
+    ctx.fillText('PLAYER OF THE MATCH', 580, 250);
+    ctx.fillStyle = '#fff'; ctx.font = `italic 900 ${fit(m.player, 900, 58, 640, 24, true)}px ${FONT}`; ctx.fillText(m.player, 580, 312);
+    const rt = ratings?.[side]?.find(x => surname(x.player) === surname(m.player));
+    if (rt) { ctx.fillStyle = TEAMS[side].color; D.roundRect(ctx, 580, 336, 92, 48, 10); ctx.fill(); ctx.fillStyle = lum(TEAMS[side].color) > 0.62 ? '#111' : '#fff'; ctx.font = `900 28px ${FONT}`; ctx.textAlign = 'center'; ctx.fillText(Number(rt.rating).toFixed(1), 626, 370); }
+    ctx.textAlign = 'left'; ctx.fillStyle = '#cfdad4'; ctx.font = `500 19px ${FONT}`;
+    wrap(m.reason, 500, 19, 600, 4).forEach((ln, i) => ctx.fillText(ln, 580, 420 + i * 27));
     ctx.restore();
-    const lg = String(an.resembles?.league || '');
-    if (lg) {
-      const lw = textW(font(800, 14), lg) + 26;
-      ctx.fillStyle = 'rgba(255,255,255,0.12)'; roundRect(ctx, 70, 218, lw, 28, 14); ctx.fill();
-      ctx.fillStyle = '#e8efe9'; ctx.font = font(800, 14); ctx.fillText(lg, 83, 232.5);
-    }
-    const why = wrap(an.resembles?.why || an.summary || '', 600, 17, W - 160, 2, 11);
-    ctx.fillStyle = '#c9d8cf'; ctx.font = font(600, why.size);
-    why.lines.forEach((ln, k) => ctx.fillText(ln, 70, 276 + k * why.size * 1.3));
-    // strengths / weaknesses
-    const colW = (W - 140 - 40) / 2;
-    const cols = [['STRENGTHS', an.strengths, '#3ddc84', '✓'], ['WEAKNESSES', an.weaknesses, '#ff6b6b', '✕']];
-    cols.forEach(([title, list, col, mark], ci) => {
-      const x = 70 + ci * (colW + 40), y0 = 340;
-      const hp = smooth(seg(lt, 700 + ci * 150, 1100 + ci * 150));
-      ctx.globalAlpha = a * hp;
-      ctx.fillStyle = col; ctx.font = font(900, 16); ctx.fillText(title, x, y0);
-      ctx.fillStyle = col; ctx.fillRect(x, y0 + 14, 40, 3);
-      (Array.isArray(list) ? list.slice(0, 3) : []).forEach((txt, k) => {
-        const ip = spr(SPR.soft, lt - 950 - ci * 150 - k * 140);
-        if (ip <= 0) return;
-        const y = y0 + 44 + k * 82;
-        ctx.globalAlpha = a * c01(ip);
-        ctx.save(); ctx.translate((1 - ip) * 30, 0);
-        ctx.fillStyle = 'rgba(255,255,255,0.06)'; roundRect(ctx, x, y - 4, colW, 72, 12); ctx.fill();
-        ctx.fillStyle = col; ctx.beginPath(); ctx.arc(x + 24, y + 32, 13, 0, Math.PI * 2); ctx.fill();
-        ctx.fillStyle = '#0b1410'; ctx.font = font(900, 15); ctx.textAlign = 'center'; ctx.fillText(mark, x + 24, y + 33);
-        ctx.textAlign = 'left';
-        const wr = wrap(txt, 600, 17, colW - 70, 2, 11);
-        ctx.fillStyle = '#eef4f0'; ctx.font = font(600, wr.size);
-        const lh = wr.size * 1.25, yy = y + 32 - ((wr.lines.length - 1) * lh) / 2;
-        wr.lines.forEach((ln, j) => ctx.fillText(ln, x + 50, yy + j * lh));
+  }
+  function drawRatings(ctx, sc, local) {
+    dimBackdrop(ctx, sc.start + local);
+    const p = clamp(local / 500, 0, 1), out = clamp((sc.dur - local) / 400, 0, 1);
+    ctx.save(); ctx.globalAlpha = Math.min(p, out);
+    ctx.fillStyle = '#ffd34d'; ctx.font = `900 18px ${FONT}`; ctx.textAlign = 'center'; ctx.fillText('PLAYER RATINGS', W / 2, 60);
+    ['A', 'B'].forEach((side, si) => {
+      const list = (ratings?.[side] || []).slice().sort((a, b) => b.rating - a.rating);
+      const x = si ? 680 : 80;
+      ctx.fillStyle = '#fff'; ctx.font = `italic 900 26px ${FONT}`; ctx.textAlign = 'left'; ctx.fillText(TEAMS[side].name, x, 104);
+      list.slice(0, 11).forEach((r, i) => {
+        const ap = clamp((local - 200 - i * 60) / 300, 0, 1);
+        const y = 140 + i * 48;
+        ctx.save(); ctx.globalAlpha = Math.min(p, out) * ap;
+        const pl = playerByName(side, r.player);
+        ctx.fillStyle = 'rgba(255,255,255,0.06)'; D.roundRect(ctx, x, y, 520, 40, 8); ctx.fill();
+        if (pl) photoCircle(ctx, pl.id, x + 22, y + 20, 15, TEAMS[side].color);
+        ctx.fillStyle = '#fff'; ctx.font = `700 16px ${FONT}`; ctx.textBaseline = 'middle'; ctx.textAlign = 'left'; ctx.fillText(r.player, x + 48, y + 21);
+        const v = Number(r.rating) || 0;
+        ctx.fillStyle = v >= 8 ? '#22c55e' : v >= 7 ? '#84cc16' : v >= 6 ? '#eab308' : '#ef4444';
+        D.roundRect(ctx, x + 456, y + 6, 54, 28, 6); ctx.fill();
+        ctx.fillStyle = '#111'; ctx.font = `900 15px ${FONT}`; ctx.textAlign = 'center'; ctx.fillText(v.toFixed(1), x + 483, y + 21);
         ctx.restore();
       });
     });
     ctx.restore();
   }
-
-  function drawEnd(ctx, sc, lt) {
-    outroBg(ctx, sc, lt);
-    const A = T.A, B = T.B;
-    const s = st.score;
-    const fin = sc.scoreBefore;
-    const p = spr(SPR.soft, lt - 80);
-    ctx.save();
-    ctx.globalAlpha = c01(p);
-    // split colour bars
-    ctx.fillStyle = A.css; ctx.fillRect(0, H / 2 - 120, mix(0, W / 2, smooth(seg(lt, 0, 500))), 8);
-    ctx.fillStyle = B.css; ctx.fillRect(W - mix(0, W / 2, smooth(seg(lt, 0, 500))), H / 2 + 112, W / 2, 8);
-    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-    ctx.fillStyle = '#f5b301'; ctx.font = font(900, 20); ctx.fillText('FULL-TIME', W / 2, H / 2 - 82);
-    const sp = spr(SPR.bouncy, lt - 300);
-    ctx.save(); ctx.translate(W / 2, H / 2 + 6); ctx.scale(sp, sp);
-    ctx.fillStyle = '#fff'; ctx.font = font(900, 120, true); ctx.fillText(`${fin[0]}–${fin[1]}`, 0, 0);
+  function drawAnalysis(ctx, sc, local) {
+    dimBackdrop(ctx, sc.start + local);
+    const a = analysis[sc.side]; if (!a) return;
+    const col = TEAMS[sc.side].color;
+    const p = clamp(local / 500, 0, 1), out = clamp((sc.dur - local) / 400, 0, 1);
+    ctx.save(); ctx.globalAlpha = Math.min(p, out);
+    ctx.fillStyle = col; ctx.fillRect(0, 0, 14, H);
+    ctx.fillStyle = '#fff'; ctx.font = `italic 900 ${fit(TEAMS[sc.side].name, 900, 40, 760, 20, true)}px ${FONT}`; ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
+    ctx.fillText(TEAMS[sc.side].name.toUpperCase(), 70, 92);
+    ctx.fillStyle = '#9fb7a8'; ctx.font = `800 15px ${FONT}`; ctx.fillText('PLAYS LIKE', 70, 140);
+    const club = a.resembles?.club || '—';
+    ctx.fillStyle = '#ffd34d'; ctx.font = `italic 900 ${fit(club, 900, 64, 700, 24, true)}px ${FONT}`; ctx.fillText(club, 70, 206);
+    ctx.fillStyle = '#e5efe9'; ctx.font = `700 16px ${FONT}`;
+    ctx.fillText(a.resembles?.league || '', 70, 236);
+    ctx.fillStyle = '#cfdad4'; ctx.font = `500 18px ${FONT}`;
+    wrap(a.resembles?.why || a.summary || '', 500, 18, 1100, 2).forEach((ln, i) => ctx.fillText(ln, 70, 274 + i * 26));
+    const col2 = (title, list, x, good) => {
+      ctx.fillStyle = good ? '#4ade80' : '#f87171'; ctx.font = `900 16px ${FONT}`; ctx.fillText(title, x, 360);
+      (list || []).slice(0, 3).forEach((s, i) => {
+        const ap = clamp((local - 600 - i * 220) / 350, 0, 1);
+        ctx.save(); ctx.globalAlpha = Math.min(p, out) * ap; ctx.translate((1 - easeOut(ap)) * 30, 0);
+        ctx.fillStyle = 'rgba(255,255,255,0.07)'; D.roundRect(ctx, x, 380 + i * 92, 540, 80, 12); ctx.fill();
+        ctx.fillStyle = good ? '#22c55e' : '#ef4444'; ctx.beginPath(); ctx.arc(x + 28, 420 + i * 92, 13, 0, Math.PI * 2); ctx.fill();
+        ctx.fillStyle = '#fff'; ctx.font = `900 14px ${FONT}`; ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillText(good ? '✓' : '✕', x + 28, 421 + i * 92);
+        ctx.textAlign = 'left'; ctx.font = `600 16px ${FONT}`;
+        wrap(s, 600, 16, 470, 3).forEach((ln, j, arr) => ctx.fillText(ln, x + 54, 420 + i * 92 + (j - (arr.length - 1) / 2) * 20));
+        ctx.restore();
+      });
+    };
+    col2('STRENGTHS', a.strengths, 70, true);
+    col2('WEAKNESSES', a.weaknesses, 670, false);
     ctx.restore();
-    ctx.font = font(900, fitSize(A.name, 900, 30, 340, 14, true), true); ctx.textAlign = 'right'; ctx.fillStyle = '#fff';
-    ctx.fillText(A.name, W / 2 - 190, H / 2 + 8);
-    ctx.font = font(900, fitSize(B.name, 900, 30, 340, 14, true), true); ctx.textAlign = 'left';
-    ctx.fillText(B.name, W / 2 + 190, H / 2 + 8);
-    const lp = smooth(seg(lt, 900, 1400));
-    ctx.globalAlpha = lp; ctx.textAlign = 'center';
-    ctx.fillStyle = '#fff'; ctx.font = font(900, 26, true); ctx.fillText('SÜPER LIG MIX', W / 2, H - 120);
-    ctx.fillStyle = '#9fb7a8'; ctx.font = font(600, 15); ctx.fillText('Draft · Simulate · Share  —  simulated by GPT-6 Luna', W / 2, H - 88);
-    ctx.restore();
-    void s;
-    dim(ctx, seg(lt, sc.dur - 500, sc.dur) * 0.6);
   }
-
-  // ------------------------------------------------------------------ public API
-  function render(ctx, t) {
-    const d = duration();
-    t = Number(t) || 0;
-    if (t < 0) t = 0;
-    if (t >= d) t = Math.max(0, d - 1);
-    const sc = scenes[sceneIndexAt(t)];
-    const lt = t - sc.start;
+  // Key moments montage: small freeze frames, rendered once each.
+  let montageCache = null;
+  const thumbCache = new Map();
+  let thumbBig = null;
+  function montageThumb(i) {
+    const m = built.moments[i];
+    const key = `${m.t}`;
+    if (!thumbCache.has(key)) {
+      thumbBig ||= Object.assign(document.createElement('canvas'), { width: W, height: H });
+      renderAt(thumbBig.getContext('2d'), m.t, true);
+      const s = document.createElement('canvas'); s.width = 384; s.height = 216; s.getContext('2d').drawImage(thumbBig, 0, 0, 384, 216);
+      thumbCache.set(key, s);
+    }
+    return thumbCache.get(key);
+  }
+  // Warm-up: render each new scene once off-screen during idle time, so the first real frame of
+  // a scene never pays for font/texture/photo uploads or text measuring.
+  const warmed = new Set();
+  let warmCv = null, warmScheduled = false, lastWarm = 0, warmHint = 0;
+  const ric = window.requestIdleCallback || (f => setTimeout(() => f({ timeRemaining: () => 8 }), 60));
+  function scheduleWarm() {
+    if (warmScheduled) return;
+    warmScheduled = true;
+    ric(function step(deadline) {
+      warmScheduled = false;
+      // Scenes just ahead of the playhead first, then everything else.
+      const scs = built.scenes.slice().sort((p, q) => {
+        const dp = p.start >= warmHint ? p.start - warmHint : 1e9 + (warmHint - p.start);
+        const dq = q.start >= warmHint ? q.start - warmHint : 1e9 + (warmHint - q.start);
+        return dp - dq;
+      });
+      for (let i = 0; i < scs.length; i++) {
+        const sc = scs[i];
+        const k = `${sc.kind}:${sc.start}`;
+        if (warmed.has(k)) continue;
+        // Rate-limited, idle-time only, so it never competes with playback.
+        if (deadline.timeRemaining() < 4 || performance.now() - lastWarm < 220) { setTimeout(scheduleWarm, 120); return; }
+        warmed.add(k); lastWarm = performance.now();
+        warmCv ||= Object.assign(document.createElement('canvas'), { width: W, height: H });
+        const wctx = warmCv.getContext('2d', { alpha: false });
+        try {
+          if (sc.kind === 'montage') { const j = built.moments.findIndex(m => !thumbCache.has(`${m.t}`)); if (j >= 0 && j < 6) { warmed.delete(k); montageThumb(j); scheduleWarm(); return; } }
+          renderAt(wctx, sc.start + Math.min(400, sc.dur / 2));
+        } catch {}
+        scheduleWarm(); return;
+      }
+    }, { timeout: 1000 });
+  }
+  function drawMontage(ctx, sc, local) {
+    dimBackdrop(ctx, sc.start + local);
+    const ms = built.moments.slice(0, 6);
+    for (let i = 0; i < ms.length; i++) montageThumb(i);
     ctx.save();
-    ctx.setTransform(1, 0, 0, 1, 0, 0);
-    ctx.globalAlpha = 1;
-    ctx.textBaseline = 'middle';
+    ctx.fillStyle = '#ffd34d'; ctx.font = `900 18px ${FONT}`; ctx.textAlign = 'center'; ctx.fillText('KEY MOMENTS', W / 2, 56);
+    ms.forEach((m, i) => {
+      const col = i % 3, row = Math.floor(i / 3);
+      const x = 40 + col * 404, y = 80 + row * 300;
+      const ap = clamp((local - i * 200) / 400, 0, 1);
+      ctx.save(); ctx.globalAlpha = ap; ctx.translate(x + 192, y + 108); ctx.scale(0.9 + 0.1 * backOut(ap), 0.9 + 0.1 * backOut(ap)); ctx.translate(-x - 192, -y - 108);
+      ctx.drawImage(montageThumb(i), x, y, 384, 216);
+      ctx.strokeStyle = m.side === 'B' ? TEAMS.B.color : TEAMS.A.color; ctx.lineWidth = 3; ctx.strokeRect(x, y, 384, 216);
+      ctx.fillStyle = '#fff'; ctx.font = `800 15px ${FONT}`; ctx.textAlign = 'left';
+      ctx.fillText(`${m.minute}  ${m.title}`.slice(0, 48), x, y + 240);
+      ctx.restore();
+    });
+    ctx.restore();
+  }
+  function drawEnd(ctx, sc, local) {
+    dimBackdrop(ctx, sc.start + local);
+    const st = built.state;
+    const p = clamp(local / 600, 0, 1);
+    ctx.save(); ctx.globalAlpha = p;
+    scoreHeader(ctx, 'FINAL SCORE', st.score, 250);
+    scorers(ctx, st.goals, 350);
+    ctx.textAlign = 'center'; ctx.fillStyle = '#9fb7a8'; ctx.font = `700 15px ${FONT}`;
+    ctx.fillText('SÜPER LIG MIX · Draft Duel · simulated by GPT-6.1 Sol · github.com/edgetr/superlig-mix', W / 2, H - 60);
+    ctx.restore();
+  }
+  function drawVar(ctx, sc, local) {
+    if (sc.clip) drawClip(ctx, sc, sc.at, 'broadcast', { noTags: true });
+    ctx.fillStyle = 'rgba(0,0,0,0.5)'; ctx.fillRect(0, 0, W, H);
+    // Scan lines
+    ctx.fillStyle = 'rgba(56,189,248,0.08)';
+    for (let y = (local / 6) % 6; y < H; y += 6) ctx.fillRect(0, y, W, 2);
+    const p = clamp(local / 400, 0, 1);
+    ctx.save(); ctx.globalAlpha = p;
+    ctx.fillStyle = '#0b1220'; D.roundRect(ctx, W / 2 - 260, H / 2 - 90, 520, 180, 16); ctx.fill();
+    ctx.strokeStyle = '#38bdf8'; ctx.lineWidth = 3; ctx.stroke();
+    ctx.fillStyle = '#38bdf8'; ctx.font = `900 48px ${FONT}`; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText('VAR', W / 2, H / 2 - 36);
+    ctx.fillStyle = '#fff'; ctx.font = `800 20px ${FONT}`;
+    const d = sc.ev.decision || sc.ev.outcome || '';
+    ctx.fillText(local > 2200 ? (d ? `Decision: ${String(d).toUpperCase()}` : 'CHECK COMPLETE') : `CHECKING — ${String(sc.ev.check || 'possible incident').toUpperCase()}`, W / 2, H / 2 + 14);
+    ctx.fillStyle = '#cfdad4'; ctx.font = `500 15px ${FONT}`;
+    wrap(sc.ev.text || '', 500, 15, 470, 2).forEach((ln, i) => ctx.fillText(ln, W / 2, H / 2 + 50 + i * 20));
+    ctx.restore();
+  }
+  const FORMATIONS_OF = f => C.FORMATION_TABLE[f] || C.FORMATION_TABLE['4-3-3'];
+
+  // ---------------------------------------------------------------- scene dispatch
+  function sceneAt(t) {
+    const sc = built.scenes;
+    let lo = 0, hi = sc.length - 1;
+    while (lo < hi) { const mid = (lo + hi + 1) >> 1; if (sc[mid].start <= t) lo = mid; else hi = mid - 1; }
+    return sc[lo];
+  }
+  function renderAt(ctx, t, noHud) {
+    const sc = sceneAt(t);
+    if (!sc) { ctx.fillStyle = '#05070c'; ctx.fillRect(0, 0, W, H); return; }
+    const local = t - sc.start;
+    ctx.save();
     switch (sc.kind) {
-      case 'intro': drawIntro(ctx, sc, lt); break;
-      case 'lineups': drawLineups(ctx, sc, lt); break;
-      case 'kickoff': drawKickoff(ctx, sc, lt); break;
-      case 'goal': drawGoal(ctx, sc, lt); break;
-      case 'ht': case 'ft': drawBreak(ctx, sc, lt); break;
-      case 'motm': drawMotm(ctx, sc, lt); break;
-      case 'team': drawTeam(ctx, sc, lt); break;
-      case 'end': drawEnd(ctx, sc, lt); break;
-      default: drawPitchScene(ctx, sc, lt);
+      case 'intro': drawIntro(ctx, sc, local); break;
+      case 'lineup': drawLineup(ctx, sc, local); break;
+      case 'toss': drawToss(ctx, sc, local); break;
+      case 'clip': {
+        const ct = (sc.trimStart || 0) + local / 1000;
+        drawClip(ctx, sc, ct, 'live');
+        if (!noHud) {
+          scorebug(ctx, sc, t, ct);
+          const g = sc.clip.marks.goalT;
+          const goalCard = g != null && ct > g + 0.25 && ct < g + 4.65 && sc.ev.outcome !== 'disallowed';
+          if (!goalCard) lowerThird(ctx, sc, ct);
+          goalGraphic(ctx, sc, ct);
+          cardGraphic(ctx, sc, ct);
+          if (sc.isWipe) wipe(ctx, local / 700, sc);
+        }
+        break;
+      }
+      case 'replay': {
+        const ct = sc.from + (local / 1000) * sc.slow;
+        drawClip(ctx, sc, ct, sc.cam, { noTags: false });
+        // Replay bug + letterbox vignette
+        ctx.fillStyle = 'rgba(0,0,0,0.25)'; ctx.fillRect(0, 0, W, 34); ctx.fillRect(0, H - 34, W, 34);
+        ctx.fillStyle = '#f8fafc'; D.roundRect(ctx, W - 176, 44, 140, 32, 6); ctx.fill();
+        ctx.fillStyle = TEAMS[sc.ev.side || 'A'].color; ctx.beginPath(); ctx.arc(W - 156, 60, 7 + Math.sin(local / 140) * 1.5, 0, Math.PI * 2); ctx.fill();
+        ctx.fillStyle = '#111'; ctx.font = `900 15px ${FONT}`; ctx.textAlign = 'left'; ctx.textBaseline = 'middle'; ctx.fillText('REPLAY', W - 140, 61);
+        if (!noHud) scorebug(ctx, { ...sc, goalAt: null }, t, sc.from);
+        if (local < 450) wipe(ctx, local / 450, null);
+        break;
+      }
+      case 'freeze': drawFreeze(ctx, sc, local); break;
+      case 'var': drawVar(ctx, sc, local); break;
+      case 'ht': drawHT(ctx, sc, local); break;
+      case 'switch': drawSwitch(ctx, sc, local); break;
+      case 'ft': drawFT(ctx, sc, local); break;
+      case 'motm': drawMotm(ctx, sc, local); break;
+      case 'ratings': drawRatings(ctx, sc, local); break;
+      case 'analysis': drawAnalysis(ctx, sc, local); break;
+      case 'montage': drawMontage(ctx, sc, local); break;
+      case 'end': drawEnd(ctx, sc, local); break;
     }
     ctx.restore();
   }
 
-  function infoAt(t) {
-    const d = duration();
-    t = Math.max(0, Math.min(Number(t) || 0, Math.max(0, d - 1)));
-    const sc = scenes[sceneIndexAt(t)];
-    const lt = t - sc.start;
-    let text = '', capIndex = null;
-    if (sc.caption) for (const c of sc.caption) if (lt >= c.t0 && lt < c.t1) { text = c.text; capIndex = c.index ?? null; break; }
-    if (!text && sc.caption && sc.caption.length && lt >= sc.caption[sc.caption.length - 1].t1) text = sc.caption[sc.caption.length - 1].text;
-    let minute = '';
-    if (sc.kind === 'ht') minute = 'HT';
-    else if (sc.kind === 'ft' || sc.kind === 'motm' || sc.kind === 'team' || sc.kind === 'end') minute = 'FT';
-    else if (sc.label) minute = sc.label;
-    const ei = capIndex ?? sc.eventIndex ?? -1;
-    const sb = scoreAt(sc, lt);
-    return { minute, score: [sb[0], sb[1]], sceneType: sc.kind === 'action' ? sc.type : sc.kind, text, eventIndex: ei, fullTimeReached: t >= ftStart() };
+  // ---------------------------------------------------------------- public API
+  function duration() { return built.state ? built.state.t : 0; }
+  function render(ctx, t) {
+    if (!built.state) rebuild();
+    if (!crownReady) { D.buildTextures([TEAMS.A.color, TEAMS.B.color], [TEAMS.A.name.toUpperCase(), TEAMS.B.name.toUpperCase(), 'SÜPER LIG MIX']); crownReady = true; }
+    renderAt(ctx, clamp(t, 0, Math.max(0, duration() - 1)));
   }
-
-  async function preload() {
-    const jobs = [];
-    for (const side of ['A', 'B']) {
-      const team = T[side];
-      for (const p of team.players) {
-        if (!p.img || typeof Image === 'undefined') continue;
-        jobs.push(new Promise(resolve => {
-          const img = new Image();
-          img.crossOrigin = 'anonymous';
-          img.decoding = 'async';
-          img.onload = () => { try { p.photo = photoSprite(team, img); } catch { /* keep initials */ } resolve(); };
-          img.onerror = () => resolve();
-          img.src = p.img;
-        }));
+  let crownReady = false;
+  function infoAt(t) {
+    if (!built.state) rebuild();
+    t = clamp(t, 0, Math.max(0, duration() - 1));
+    const sc = sceneAt(t);
+    if (!sc) return { minute: '', score: [0, 0], sceneType: '', text: '', eventIndex: -1, fullTimeReached: false };
+    let minute = '', score = sc.scoreBefore ? scoreAt(sc, t) : (sc.score || built.state.score);
+    if (sc.kind === 'clip' || sc.kind === 'replay' || sc.kind === 'freeze' || sc.kind === 'var') minute = minuteStr(sc.min, sc.add);
+    if (sc.kind === 'ht' || sc.kind === 'switch') minute = 'HT';
+    if (['ft', 'motm', 'ratings', 'analysis', 'montage', 'end'].includes(sc.kind)) { minute = 'FT'; score = built.state.score; }
+    if (['intro', 'lineup', 'toss'].includes(sc.kind)) { minute = ''; score = [0, 0]; }
+    const ftStart = typeof built.state.ftStart === 'number' ? built.state.ftStart : (built.state.ftWhistle ?? Infinity);
+    return { minute, score, sceneType: sc.kind === 'clip' ? (sc.ev?.type || 'clip') : sc.kind, text: sc.ev?.text || '', eventIndex: sc.idx ?? -1, fullTimeReached: t >= ftStart };
+  }
+  let preloadP = null;
+  function preload() { return (preloadP ||= preloadOnce()); }
+  async function preloadOnce() {
+    if (!crownReady) { D.buildTextures([TEAMS.A.color, TEAMS.B.color], [TEAMS.A.name.toUpperCase(), TEAMS.B.name.toUpperCase(), 'SÜPER LIG MIX']); crownReady = true; }
+    const all = [...TEAMS.A.players, ...TEAMS.B.players];
+    await Promise.all(all.map(p => new Promise(res => {
+      if (!p.img) return res();
+      const img = new Image();
+      img.crossOrigin = 'anonymous'; img.referrerPolicy = 'no-referrer';
+      img.onload = async () => {
+        // Decode now so the first frame that shows this face doesn't stall.
+        try { await img.decode(); } catch {}
+        // Pre-render a small avatar once: drawing big photos mid-playback forces a decode + GPU upload.
+        const av = document.createElement('canvas'); av.width = 160; av.height = 208;
+        av.getContext('2d').drawImage(img, 0, 0, 160, 208);
+        photos.set(p.id, av); try { looks.set(p.id, sampleLook(img)); } catch {} lookCache = null; res();
+      };
+      img.onerror = () => res();
+      img.src = p.img;
+    })));
+    montageCache = null; thumbCache.clear(); warmed.clear();
+    scheduleWarm();
+  }
+  // Rehearsal: while the players look at the line-ups, render every kind of scene once on a hidden
+  // canvas using a short practice script with the real teams. Fonts, photos and graphics are then
+  // warm before kick-off, so the first goal, card or analysis image never stutters.
+  let rehearsed = false;
+  async function rehearse() {
+    if (rehearsed) return; rehearsed = true;
+    const A = TEAMS.A.players.map(p => p.name), B = TEAMS.B.players.map(p => p.name);
+    const ev = d => ({ kind: 'ev', data: d });
+    const script = [
+      { kind: 'meta', data: { kickoff: 'A', referee: 'Referee', weather: 'Clear', headline: 'Warm-up', styles: meta?.styles || null } },
+      ev({ min: 10, add: 0, type: 'shot', side: 'A', player: A[9], assist: A[7], x: 89, y: 46, outcome: 'goal', target: 'bottom_left', assist_type: 'through_ball', text: `${A[9]} scores.` }),
+      ev({ min: 20, add: 0, type: 'foul', side: 'B', player: B[9], offender: A[3], x: 80, y: 60, card: 'yellow', text: 'Booked.' }),
+      ev({ min: 21, add: 0, type: 'shot', side: 'B', player: B[8], x: 80, y: 60, outcome: 'saved', technique: 'free_kick', assist_type: 'free_kick', target: 'top_left', xg: 0.4, text: 'Saved.' }),
+      ev({ min: 30, add: 0, type: 'offside', side: 'B', player: B[10], assist: B[8], x: 85, y: 40, text: 'Offside.' }),
+      ev({ min: 45, add: 1, type: 'half_time', text: 'Half-time.' }),
+      ev({ min: 60, add: 0, type: 'shot', side: 'B', player: B[10], assist: B[7], x: 91, y: 40, outcome: 'woodwork', body: 'head', assist_type: 'cross', text: 'Post!' }),
+      ev({ min: 90, add: 2, type: 'full_time', text: 'Full time.' }),
+      { kind: 'stats', data: { possession: [50, 50], shots: [5, 5], on_target: [2, 2], xg: [1, 1], corners: [3, 3], fouls: [9, 9], offsides: [1, 1], yellow: [1, 0], red: [0, 0], motm: { side: 'A', player: A[9], reason: 'Warm-up.' } } },
+      { kind: 'ratings', data: { A: A.map(n => ({ player: n, rating: 7 })), B: B.map(n => ({ player: n, rating: 7 })) } },
+      { kind: 'analysis', data: { side: 'A', summary: 'x', strengths: ['a', 'b', 'c'], weaknesses: ['a', 'b', 'c'], resembles: { club: 'Club', league: 'League', why: 'x' } } },
+      { kind: 'analysis', data: { side: 'B', summary: 'x', strengths: ['a', 'b', 'c'], weaknesses: ['a', 'b', 'c'], resembles: { club: 'Club', league: 'League', why: 'x' } } },
+      { kind: 'end', data: {} },
+    ];
+    const rh = createMatch({ teams: TEAMS });
+    rh.__shareAssets(photos, looks);
+    rh.setItems(script);
+    await rh.ready();
+    const cv = Object.assign(document.createElement('canvas'), { width: W, height: H });
+    const c2 = cv.getContext('2d', { alpha: false });
+    for (const sc of rh.scenes()) {
+      for (const off of [120, Math.min(1600, sc.dur * 0.6)]) {
+        await new Promise(r => setTimeout(r, 30));
+        try { rh.render(c2, sc.start + off); } catch {}
       }
     }
-    await Promise.all(jobs);
   }
-
   return {
+    rehearse,
+    __shareAssets(ph, lk) { ph.forEach((v, k) => photos.set(k, v)); lk.forEach((v, k) => looks.set(k, v)); lookCache = null; crownReady = true; },
     setItems,
     get duration() { return duration(); },
     get complete() { return complete; },
-    render,
-    infoAt,
-    preload,
-    score() { return [st.score[0], st.score[1]]; },
-    timeline,
-    // extras for integrators / debugging
-    scenes() { return scenes.map(s => ({ kind: s.kind, start: s.start, dur: s.dur, eventIndex: s.eventIndex ?? -1, type: s.type || null })); },
-    teams: T,
+    render, infoAt, preload, ready,
+    warmAround: t => { warmHint = t; scheduleWarm(); },
+    score: () => [...(built.state?.score || [0, 0])],
+    timeline: () => built.tl,
+    moments: () => built.moments,
+    scenes: () => built.scenes.map(s => ({ kind: s.kind, start: s.start, dur: s.dur, type: s.ev?.type, outcome: s.ev?.outcome })),
+    teams: TEAMS,
   };
+}
+
+// Skin tone and hair colour sampled from the player's photo (white/grey background ignored).
+function sampleLook(img) {
+  const c = document.createElement('canvas'); c.width = 30; c.height = 39;
+  const x = c.getContext('2d', { willReadFrequently: true });
+  x.drawImage(img, 0, 0, 30, 39);
+  const d = x.getImageData(0, 0, 30, 39).data;
+  const avg = (y0, y1, x0, x1) => {
+    let r = 0, g = 0, b = 0, n = 0;
+    for (let y = y0; y < y1; y++) for (let xx = x0; xx < x1; xx++) {
+      const i = (y * 30 + xx) * 4; const R = d[i], G = d[i + 1], B = d[i + 2];
+      const mx = Math.max(R, G, B), mn = Math.min(R, G, B);
+      if (mx > 200 && mx - mn < 22) continue;     // background
+      if (mx - mn < 10 && mx > 120) continue;
+      r += R; g += G; b += B; n++;
+    }
+    return n > 6 ? [r / n, g / n, b / n, n] : null;
+  };
+  const face = avg(14, 22, 11, 19);
+  const hair = avg(2, 7, 9, 21);
+  const hex = v => '#' + v.slice(0, 3).map(n => Math.round(n).toString(16).padStart(2, '0')).join('');
+  const skin = face ? hex(face) : '#c8956b';
+  let hairC = hair ? hex(hair) : null;
+  if (hair && face && Math.abs(hair[0] - face[0]) + Math.abs(hair[1] - face[1]) < 40) hairC = null; // bald / shaved
+  return { skin, hair: hairC };
 }

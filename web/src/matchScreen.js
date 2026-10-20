@@ -1,4 +1,4 @@
-// Match screen: plays the GPT-6 Luna simulation as an animated canvas "video", synced between
+// Match screen: plays the GPT-6.1 Sol simulation as an animated canvas "video", synced between
 // both players (pause / resume / seek / speed are shared), with a live commentary feed,
 // spoiler-free stats/ratings/analysis after full time, and video download.
 import { animate, spring, stagger } from 'motion';
@@ -8,8 +8,8 @@ import { byId } from './draft.js';
 import { FORMATIONS } from '../../shared/game.js';
 
 const $ = s => document.querySelector(s);
-const ICON = { goal: '⚽', penalty_goal: '⚽', own_goal: '⚽', yellow: '🟨', second_yellow: '🟨🟥', red: '🟥', save: '🧤', woodwork: '🥅', var: '📺', injury: '🩹', penalty_miss: '❌', half_time: '⏸', full_time: '🏁', kickoff: '▶', second_half: '▶', corner: '⛳', offside: '🚩', chance: '🔥', shot: '🎯', block: '🛡' };
-const BIG = new Set(['goal', 'penalty_goal', 'own_goal', 'red', 'second_yellow', 'penalty_miss', 'half_time', 'full_time', 'var', 'woodwork']);
+const ICON = { foul: '✕', penalty: '🎯', flow: '↔', goal: '⚽', penalty_goal: '⚽', own_goal: '⚽', yellow: '🟨', second_yellow: '🟨🟥', red: '🟥', save: '🧤', woodwork: '🥅', var: '📺', injury: '🩹', penalty_miss: '❌', half_time: '⏸', full_time: '🏁', kickoff: '▶', second_half: '▶', corner: '⛳', offside: '🚩', chance: '🔥', shot: '🎯', block: '🛡' };
+const BIG = new Set(['goal', 'penalty_goal', 'own_goal', 'red', 'second_yellow', 'penalty_miss', 'half_time', 'full_time', 'var', 'woodwork', 'penalty']);
 const fmtT = ms => { const s = Math.max(0, Math.floor(ms / 1000)); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`; };
 
 export function createMatchScreen({ client, api, getSess, toast, serverNow }) {
@@ -20,7 +20,7 @@ export function createMatchScreen({ client, api, getSess, toast, serverNow }) {
   let match = null, jobId = null, items = [], unsubEvents = null;
   let raf = 0, lastDrawT = -1, lastDrawLen = -1;
   let seeking = null;           // local preview position while dragging the seek bar
-  let autoPaused = false;       // host paused because GPT-6 Luna hasn't written that far yet
+  let autoPaused = false;       // host paused because GPT-6.1 Sol hasn't written that far yet
   let tab = 'live', revealed = false, exporting = null, lastFeedLen = -1;
 
   const sess = () => getSess();
@@ -31,7 +31,7 @@ export function createMatchScreen({ client, api, getSess, toast, serverNow }) {
   function teamsFrom(r) {
     const team = s => ({
       name: s.teamName, color: s.color, formation: s.formation,
-      players: s.xi.map((id, i) => { const p = byId.get(id); return { id, name: p.name, role: FORMATIONS[s.formation][i][0], img: p.img, value: p.value }; }),
+      players: s.xi.map((id, i) => { const p = byId.get(id); return { id, name: p.name, role: FORMATIONS[s.formation][i][0], img: p.img, value: p.value, num: p.num ?? null, foot: p.foot ?? null, age: p.age ?? null, club: p.clubName }; }),
     });
     return { A: team(r.host), B: team(r.guest) };
   }
@@ -58,7 +58,7 @@ export function createMatchScreen({ client, api, getSess, toast, serverNow }) {
       match.setItems(items);
       lastDrawLen = -1;
       updateBuffer();
-      renderSide(true);
+      renderSide(tab !== 'live'); // the live feed updates incrementally from the render loop
     });
     renderTabs();
   }
@@ -69,12 +69,17 @@ export function createMatchScreen({ client, api, getSess, toast, serverNow }) {
     if (!room || !match || exporting) return; // the exporter gets the CPU/GPU to itself
     const t = position();
     if (t !== lastDrawT || items.length !== lastDrawLen) {
+      const t0 = performance.now();
       match.render(ctx, t);
+      const t1 = performance.now();
       lastDrawT = t; lastDrawLen = items.length;
       updateProgress(t);
       renderSide(false);
+      const t2 = performance.now();
+      if (window.__perfDebug && t2 - t0 > 5) (window.__spikes ||= []).push({ t: Math.round(t), render: +(t1 - t0).toFixed(1), side: +(t2 - t1).toFixed(1), info: match.infoAt(t).sceneType });
     }
     handleBuffering();
+    if (match.warmAround && (loop.n = (loop.n || 0) + 1) % 90 === 0) match.warmAround(t);
   }
 
   function handleBuffering() {
@@ -85,13 +90,13 @@ export function createMatchScreen({ client, api, getSess, toast, serverNow }) {
     const wait = $('#mWait');
     const showWait = (underrun || (!pb.playing && autoPaused)) && !failed;
     if (wait.hidden === showWait) wait.hidden = !showWait;
-    if (showWait) $('#mWaitText').textContent = room.sim.phase || 'GPT-6 Luna is writing the match…';
+    if (showWait) $('#mWaitText').textContent = room.sim.phase || 'GPT-6.1 Sol is writing the match…';
     if (failed && !handleBuffering.failShown) { handleBuffering.failShown = true; toast('The simulation stopped', room.sim.error || ''); }
     if (!failed) handleBuffering.failShown = false;
     $('#mBigPlay').hidden = !(ended && !pb.playing);
     $('#mPlay').textContent = pb.playing ? '❚❚' : '▶';
     if (!isHost()) return;
-    // The host is the clock authority while GPT-6 Luna is still streaming.
+    // The host is the clock authority while GPT-6.1 Sol is still streaming.
     const now = performance.now();
     if (now - (handleBuffering.last || 0) < 500) return;
     if (underrun) { handleBuffering.last = now; autoPaused = true; setPlayback(false, dur); }
@@ -211,8 +216,9 @@ export function createMatchScreen({ client, api, getSess, toast, serverNow }) {
   // ---------------------------------------------------------------- side panel
   const mTabs = $('#mTabs');
   function renderTabs() {
-    const list = [['live', 'Live'], ['stats', 'Stats'], ['ratings', 'Ratings'], ['analysis', 'Analysis']];
-    mTabs.innerHTML = list.map(([k, l]) => `<button data-t="${k}" class="${tab === k ? 'on' : ''}" ${k !== 'live' && !revealed ? 'disabled title="Revealed at full time"' : ''}>${l}${k !== 'live' && !revealed ? ' 🔒' : ''}</button>`).join('');
+    const list = [['live', 'Live'], ['moments', 'Moments'], ['stats', 'Stats'], ['ratings', 'Ratings'], ['analysis', 'Analysis']];
+    const locked = k => !['live', 'moments'].includes(k) && !revealed;
+    mTabs.innerHTML = list.map(([k, l]) => `<button data-t="${k}" class="${tab === k ? 'on' : ''}" ${locked(k) ? 'disabled title="Revealed at full time"' : ''}>${l}${locked(k) ? ' 🔒' : ''}</button>`).join('');
   }
   mTabs.addEventListener('click', e => {
     const b = e.target.closest('button[data-t]');
@@ -222,6 +228,36 @@ export function createMatchScreen({ client, api, getSess, toast, serverNow }) {
   });
 
   const kind = k => items.find(i => i.kind === k)?.data;
+  // Analysis-image thumbnails, rendered once per moment from the deterministic renderer.
+  const thumbs = new Map();
+  let thumbCanvas = null;
+  function frameAt(t, w, h) {
+    thumbCanvas ||= Object.assign(document.createElement('canvas'), { width: W, height: H });
+    match.render(thumbCanvas.getContext('2d', { alpha: false }), t);
+    if (w === W) return thumbCanvas;
+    const c = Object.assign(document.createElement('canvas'), { width: w, height: h });
+    c.getContext('2d').drawImage(thumbCanvas, 0, 0, w, h);
+    return c;
+  }
+  function thumb(t) {
+    const k = `${jobId}:${t}`;
+    if (!thumbs.has(k)) thumbs.set(k, new Promise(res => requestAnimationFrame(() => res(frameAt(t, 352, 198).toDataURL('image/jpeg', 0.82)))));
+    return thumbs.get(k);
+  }
+  $('#mPanel').addEventListener('click', e => {
+    const seek = e.target.closest('[data-seek]');
+    if (seek) { autoPaused = false; setPlayback(false, Number(seek.dataset.seek)); return; }
+    const png = e.target.closest('[data-png]');
+    if (png) {
+      const m = match.moments()[Number(png.dataset.png)];
+      frameAt(m.t, W, H).toBlob(b => {
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(b);
+        a.download = `${m.minute.replace(/[^0-9+]/g, '')}-${m.title.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '')}.png`;
+        a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 30_000);
+      }, 'image/png');
+    }
+  });
   function renderSide(force) {
     if (!room || !match) return;
     const t = position();
@@ -246,12 +282,14 @@ export function createMatchScreen({ client, api, getSess, toast, serverNow }) {
     const panel = $('#mPanel');
     if (tab === 'live') {
       const tl = match.timeline ? match.timeline() : [];
-      const shown = tl.filter(s => s.kind === 'ev' && s.start <= t && s.itemIndex >= 0);
+      const shown = tl.filter(s => s.kind === 'ev' && s.start <= t && s.itemIndex >= 0).sort((a, b) => a.start - b.start);
       if (!force && shown.length === lastFeedLen) return;
       const row = s => {
         const d = items[s.itemIndex]?.data || {};
-        const c = d.side === 'A' ? room.host.color : d.side === 'B' ? room.guest.color : '#888';
-        return `<div class="feed-item${BIG.has(d.type) ? ' big' : ''}" style="--c:${c}"><span class="fm">${esc(s.minute || '')}</span><span class="ft">${ICON[d.type] ? `<span class="ic">${ICON[d.type]}</span>` : ''}${esc(d.text || '')}</span></div>`;
+        const ty = s.type || d.type;
+        const sideKey = ty === 'flow' ? d.momentum : d.side;
+        const c = sideKey === 'A' ? room.host.color : sideKey === 'B' ? room.guest.color : '#888';
+        return `<div class="feed-item${BIG.has(ty) ? ' big' : ''}${ty === 'flow' ? ' flow' : ''}" style="--c:${c}"><span class="fm">${esc(s.minute || '')}</span><span class="ft">${ICON[ty] ? `<span class="ic">${ICON[ty]}</span>` : ''}${esc(d.text || d.note || '')}</span></div>`;
       };
       // Normal playback only appends: insert just the new rows at the top instead of rebuilding the list.
       if (!force && lastFeedLen > 0 && shown.length > lastFeedLen && panel.querySelector('.feed-item')) {
@@ -264,6 +302,24 @@ export function createMatchScreen({ client, api, getSess, toast, serverNow }) {
       lastFeedLen = shown.length;
       panel.innerHTML = shown.length ? shown.slice().reverse().map(row).join('')
         : `<p class="muted" style="text-align:center;margin-top:30px">${room.sim.state === 'error' ? esc(room.sim.error) : 'Kick-off soon…'}</p>`;
+      return;
+    }
+    if (tab === 'moments') {
+      const ms = match.moments ? match.moments() : [];
+      const seen = ms.filter(m => m.t <= t + 50);
+      const key = `${ms.length}:${seen.length}`;
+      if (!force && panel.dataset.mk === key) return;
+      panel.dataset.mk = key;
+      panel.innerHTML = ms.length ? ms.map((m, i) => {
+        const ok = m.t <= t + 50 || revealed;
+        const c = m.side === 'B' ? room.guest.color : room.host.color;
+        return `<div class="moment${ok ? '' : ' locked'}" data-i="${i}" style="--c:${c}">
+          <div class="mthumb">${ok ? `<img alt="" data-t="${m.t}">` : '<span>🔒 Watch on to unlock</span>'}</div>
+          <div class="mmeta"><b>${esc(m.minute)}</b> ${esc(ok ? m.title : 'Key moment')}</div>
+          ${ok ? `<div class="mact"><button class="btn small" data-seek="${m.t}">▶ Jump to</button><button class="btn small" data-png="${i}">⬇ Image</button></div>` : ''}
+        </div>`;
+      }).join('') : '<p class="muted" style="text-align:center;margin-top:30px">Big moments (goals, saves, cards, offsides) appear here as analysis images.</p>';
+      panel.querySelectorAll('img[data-t]').forEach(img => thumb(Number(img.dataset.t)).then(u => { img.src = u; }));
       return;
     }
     if (!force) return;
@@ -321,6 +377,14 @@ export function createMatchScreen({ client, api, getSess, toast, serverNow }) {
     renderFoot();
     lastDrawT = -1;
   }
+  // Build the match (textures, photos, warm-up) while both players look at the line-ups.
+  function prepare(r) {
+    room = r;
+    if (!r.sim?.jobId) return;
+    const fresh = jobId !== r.sim.jobId;
+    ensureMatch(r);
+    if (fresh) match.preload?.().then(() => match.rehearse?.());
+  }
   function show(on) {
     if (on === visible) return;
     visible = on;
@@ -328,9 +392,9 @@ export function createMatchScreen({ client, api, getSess, toast, serverNow }) {
     if (on) {
       raf = requestAnimationFrame(loop);
       animate('#mVideo', { opacity: [0, 1], transform: ['scale(.97)', 'scale(1)'] }, { type: spring, stiffness: 300, damping: 30 });
-    } else if (!on) {
+    } else if (!on && room?.status !== 'lineups') {
       unsubEvents?.(); unsubEvents = null; match = null; jobId = null;
     }
   }
-  return { update, show };
+  return { update, show, prepare };
 }

@@ -1,119 +1,57 @@
-// A realistic full mock match for developing / testing the renderer (not used in production).
+// A realistic mock match in the GPT-6.1 Sol JSON Lines format, used by the lab page and tests.
 import { PLAYERS } from '../../../shared/players.js';
 import { FORMATIONS } from '../../../shared/game.js';
 
-const byName = new Map(PLAYERS.map(p => [p.name, p]));
+const byName = n => PLAYERS.find(p => p.name === n);
 function team(name, color, formation, names) {
-  const f = FORMATIONS[formation];
   return {
     name, color, formation,
     players: names.map((n, i) => {
-      const p = byName.get(n);
-      return { id: p?.id || n, name: n, role: f[i][0], img: p?.img || '', value: p?.value || null };
+      const p = byName(n) || PLAYERS[i];
+      return { id: p.id, name: p.name, role: FORMATIONS[formation][i][0], img: p.img, value: p.value, num: p.num, foot: p.foot, age: p.age, club: p.clubName };
     }),
   };
 }
+const gk = (club) => PLAYERS.find(p => p.club === club && p.pos === 'Goalkeeper').name;
+const pickPos = (club, pos, n = 1, skip = 0) => PLAYERS.filter(p => p.club === club && p.pos === pos).slice(skip, skip + n).map(p => p.name);
+
+const A_NAMES = [gk('mci'), ...pickPos('ars', 'Left-Back'), ...pickPos('liv', 'Centre-Back'), ...pickPos('rma', 'Centre-Back'), ...pickPos('bar', 'Right-Back'),
+  ...pickPos('mci', 'Central Midfield'), ...pickPos('liv', 'Defensive Midfield'), ...pickPos('ars', 'Central Midfield'), ...pickPos('bar', 'Left Winger'), ...pickPos('mci', 'Centre-Forward'), ...pickPos('liv', 'Right Winger')];
+const B_NAMES = [gk('gs'), ...pickPos('fb', 'Left-Back'), ...pickPos('gs', 'Centre-Back'), ...pickPos('bjk', 'Centre-Back'), ...pickPos('ts', 'Right-Back'),
+  ...pickPos('fb', 'Defensive Midfield'), ...pickPos('bjk', 'Central Midfield'), ...pickPos('gs', 'Left Winger'), ...pickPos('fb', 'Attacking Midfield'), ...pickPos('gs', 'Right Winger'), ...pickPos('gs', 'Centre-Forward')];
 
 export const MOCK_TEAMS = {
-  A: team('Ege Galácticos', '#e3262f', '4-3-3', [
-    'Uğurcan Çakır', 'Ismail Jakobs', 'Davinson Sánchez', 'Milan Škriniar', 'Nélson Semedo',
-    'Gabriel Sara', "N'Golo Kanté", 'İlkay Gündoğan', 'Rafael Leão', 'Victor Osimhen', 'Mason Greenwood',
-  ]),
-  B: team('Boğaz United', '#2563eb', '4-2-3-1', [
-    'Ederson', 'Archie Brown', 'Nathan Aké', 'Abdülkerim Bardakcı', 'Wilfried Singo',
-    'Wilfred Ndidi', 'Orkun Kökçü', 'Leandro Trossard', 'Marco Asensio', 'Mohamed Salah', 'Dušan Vlahović',
-  ]),
+  A: team('Ege Galácticos', '#e3262f', '4-3-3', A_NAMES),
+  B: team('Burak Boğazları', '#2563eb', '4-2-3-1', B_NAMES),
 };
-
-// Key moments; every other minute gets a generated commentary beat.
-const KEY = [
-  [1, 0, 'kickoff', 'A', null, null, 'center', 'Osimhen rolls it back to Gündoğan and we are under way on neutral ground!'],
-  [4, 0, 'chance', 'B', 'Mohamed Salah', 'Orkun Kökçü', 'right', 'Kökçü threads it to Salah, who cuts inside and curls just wide.'],
-  [7, 0, 'corner', 'A', 'Davinson Sánchez', 'Mason Greenwood', 'left', 'Greenwood whips in a corner, Sánchez rises but heads over.'],
-  [9, 0, 'foul', 'B', 'Wilfred Ndidi', null, 'center', 'Ndidi clips Kanté in midfield. Free kick.'],
-  [12, 0, 'save', 'A', 'Victor Osimhen', 'Rafael Leão', 'left', 'Leão bursts down the left, squares for Osimhen — Ederson spreads himself and saves!'],
-  [16, 0, 'goal', 'B', 'Dušan Vlahović', 'Leandro Trossard', 'left', 'Trossard cuts back and Vlahović smashes it into the roof of the net! 0-1!'],
-  [19, 0, 'yellow', 'A', 'Nélson Semedo', null, 'left', 'Semedo goes into the book for a cynical tug on Trossard.'],
-  [22, 0, 'free_kick', 'A', 'Mason Greenwood', null, 'right', 'Greenwood steps up from 25 yards… Ederson tips it over!'],
-  [25, 0, 'woodwork', 'B', 'Marco Asensio', null, 'center', 'Asensio lets fly from distance — it cannons back off the post!'],
-  [28, 0, 'offside', 'A', 'Victor Osimhen', null, 'center', 'Osimhen times his run a fraction early. Flag up.'],
-  [31, 0, 'goal', 'A', 'Rafael Leão', 'İlkay Gündoğan', 'left', 'Gündoğan finds Leão in stride, he skips past Singo and slots it home! 1-1!'],
-  [34, 0, 'block', 'B', 'Mohamed Salah', null, 'right', 'Salah shapes to shoot but Škriniar throws himself in the way.'],
-  [37, 0, 'injury', 'B', 'Nathan Aké', null, null, 'Aké needs treatment after a clash of heads. He will carry on.'],
-  [40, 0, 'shot', 'A', 'Gabriel Sara', null, 'center', 'Sara tries his luck from range, dragging it wide.'],
-  [43, 0, 'yellow', 'B', 'Orkun Kökçü', null, 'center', 'Kökçü booked for stopping a counter.'],
-  [45, 2, 'chance', 'A', 'Mason Greenwood', 'Victor Osimhen', 'right', 'Last action of the half: Greenwood cuts in, his shot flashes past the far post.'],
-  [45, 3, 'half_time', null, null, null, null, 'Half-time: 1-1 after an end-to-end 45 minutes.'],
-  [46, 0, 'second_half', null, null, null, null, 'We go again — Boğaz United get the second half started.'],
-  [49, 0, 'corner', 'B', 'Nathan Aké', 'Marco Asensio', 'left', 'Asensio corner, Aké meets it — Çakır claims under pressure.'],
-  [52, 0, 'var', 'A', 'Victor Osimhen', null, 'center', 'VAR checking a possible penalty after Bardakcı went through Osimhen…'],
-  [53, 0, 'penalty_goal', 'A', 'Victor Osimhen', null, 'center', 'Penalty given! Osimhen sends Ederson the wrong way. 2-1!'],
-  [57, 0, 'save', 'B', 'Dušan Vlahović', 'Mohamed Salah', 'right', 'Salah slips Vlahović in, but Çakır is out quickly to block with his legs!'],
-  [61, 0, 'second_yellow', 'B', 'Orkun Kökçü', null, 'center', 'Second yellow for Kökçü — a late lunge on Kanté. Boğaz United down to ten!'],
-  [64, 0, 'free_kick', 'A', 'İlkay Gündoğan', null, 'center', 'Gündoğan over the free kick… it curls wide of the post.'],
-  [68, 0, 'goal', 'B', 'Mohamed Salah', 'Leandro Trossard', 'right', 'Ten men level it! Salah dances past Jakobs and bends it in. 2-2!'],
-  [71, 0, 'shot', 'B', 'Marco Asensio', null, 'center', 'Asensio skies one from the edge of the box.'],
-  [74, 0, 'chance', 'A', 'Rafael Leão', 'Victor Osimhen', 'left', 'Osimhen lays it off to Leão, whose shot is deflected wide.'],
-  [77, 0, 'red', 'A', 'Davinson Sánchez', null, 'center', 'Straight red for Sánchez! Last man, denying Vlahović a clear run on goal.'],
-  [80, 0, 'save', 'B', 'Leandro Trossard', null, 'left', 'Trossard\'s low drive is turned around the post by Çakır.'],
-  [83, 0, 'penalty_miss', 'B', 'Dušan Vlahović', null, 'center', 'Penalty to Boğaz United… Vlahović hits it high — Çakır saves!'],
-  [87, 0, 'goal', 'A', 'Mason Greenwood', 'Rafael Leão', 'right', 'Greenwood! A stunning half-volley from Leão\'s cross. 3-2!'],
-  [90, 2, 'own_goal', 'B', 'Milan Škriniar', null, 'right', 'Drama! Salah\'s cross deflects off Škriniar and into his own net. 3-3!'],
-  [90, 4, 'woodwork', 'A', 'Victor Osimhen', null, 'center', 'Osimhen\'s header crashes against the bar with the last touch!'],
-  [90, 5, 'full_time', null, null, null, null, 'Full-time! A breathless 3-3 on neutral ground.'],
+const A = MOCK_TEAMS.A.players.map(p => p.name), B = MOCK_TEAMS.B.players.map(p => p.name);
+const ev = (d) => ({ kind: 'ev', data: d });
+export const MOCK_ITEMS = [
+  { kind: 'meta', data: { kickoff: 'A', referee: 'Cüneyt Çakır', weather: 'Clear, 14°C, light breeze', headline: 'Premier League polish against Süper Lig fire on neutral ground.', styles: {
+    A: { style: 'possession', line: 'high', press: 'high', width: 'wide', tempo: 'medium', build: 'short' },
+    B: { style: 'counter-attack', line: 'deep', press: 'mid', width: 'narrow', tempo: 'fast', build: 'direct' } } } },
+  { kind: 'flow', data: { from: 1, to: 10, momentum: 'A', possession: [64, 36], note: `${MOCK_TEAMS.A.name} keep the ball, ${MOCK_TEAMS.B.name} sit in a compact block.` } },
+  ev({ min: 4, add: 0, type: 'foul', side: 'A', player: A[8], offender: B[4], x: 58, y: 18, card: null, text: `${B[4]} clips ${A[8]} on the touchline.` }),
+  ev({ min: 9, add: 0, type: 'shot', side: 'A', player: A[9], assist: A[5], x: 89, y: 46, outcome: 'goal', target: 'bottom_left', body: 'right', technique: 'placed', assist_type: 'through_ball', build_up: 'possession', xg: 0.42, text: `${A[5]} threads it through and ${A[9]} slots it into the bottom corner!` }),
+  ev({ min: 17, add: 0, type: 'shot', side: 'B', player: B[10], assist: B[7], x: 93, y: 41, outcome: 'saved', target: 'top_left', body: 'head', technique: 'header', assist_type: 'cross', build_up: 'counter', xg: 0.31, text: `${B[7]} whips it in, ${B[10]} heads goalwards — brilliant save from ${A[0]}!` }),
+  ev({ min: 23, add: 0, type: 'offside', side: 'B', player: B[10], assist: B[8], x: 84, y: 36, text: `${B[10]} is caught a yard offside as he breaks clear.` }),
+  ev({ min: 29, add: 0, type: 'foul', side: 'A', player: A[10], offender: B[5], x: 79, y: 40, card: 'yellow', text: `${B[5]} cynically drags back ${A[10]} — booked.` }),
+  ev({ min: 30, add: 0, type: 'shot', side: 'A', player: A[7], x: 79, y: 40, outcome: 'woodwork', target: 'top_right', technique: 'free_kick', assist_type: 'free_kick', body: 'right', xg: 0.07, text: `${A[7]} curls the free kick over the wall… off the crossbar!` }),
+  ev({ min: 38, add: 0, type: 'shot', side: 'B', player: B[8], x: 75, y: 50, outcome: 'off_target', target: 'wide_right', technique: 'long_range', build_up: 'counter', assist_type: 'solo', xg: 0.04, text: `${B[8]} lets fly from distance, just wide.` }),
+  ev({ min: 45, add: 1, type: 'corner', side: 'A', player: A[7], y: 92, text: 'Corner for the Galácticos, headed away.' }),
+  ev({ min: 45, add: 2, type: 'half_time', text: 'Half-time: the Galácticos lead through that early goal.' }),
+  { kind: 'flow', data: { from: 46, to: 55, momentum: 'B', possession: [45, 55], note: `${MOCK_TEAMS.B.name} come out flying after the break.` } },
+  ev({ min: 52, add: 0, type: 'foul', side: 'B', player: B[10], offender: A[3], x: 92, y: 30, penalty: true, card: null, text: `${A[3]} brings down ${B[10]} in the box — penalty!` }),
+  ev({ min: 53, add: 0, type: 'shot', side: 'B', player: B[10], x: 89, y: 50, outcome: 'goal', target: 'bottom_right', technique: 'penalty', assist_type: 'penalty', body: 'right', xg: 0.79, text: `${B[10]} sends ${A[0]} the wrong way. All square!` }),
+  ev({ min: 61, add: 0, type: 'foul', side: 'A', player: A[9], offender: B[5], x: 66, y: 55, card: 'yellow', text: `${B[5]} goes through the back of ${A[9]} — second yellow, he's off!` }),
+  ev({ min: 70, add: 0, type: 'shot', side: 'A', player: A[10], assist: A[1], x: 88, y: 30, outcome: 'disallowed', reason: 'offside', target: 'bottom_right', assist_type: 'cross', body: 'left', xg: 0.35, text: `${A[10]} finishes — but the flag is up. Offside, no goal.` }),
+  ev({ min: 78, add: 0, type: 'shot', side: 'A', player: A[8], assist: A[6], x: 86, y: 22, outcome: 'parried', target: 'bottom_left', assist_type: 'short_pass', body: 'right', xg: 0.22, text: `${A[8]} cuts inside and drills it low — parried wide.` }),
+  ev({ min: 84, add: 0, type: 'shot', side: 'A', player: A[9], assist: A[10], x: 91, y: 37, outcome: 'goal', target: 'top_left', body: 'head', technique: 'header', assist_type: 'cross', build_up: 'possession', xg: 0.38, text: `${A[10]} crosses and ${A[9]} rises to power a header into the top corner!` }),
+  ev({ min: 90, add: 3, type: 'shot', side: 'B', player: B[10], x: 84, y: 34, outcome: 'blocked', assist_type: 'short_pass', assist: B[8], xg: 0.12, text: 'Last-gasp effort blocked!' }),
+  ev({ min: 90, add: 4, type: 'full_time', text: 'Full time! The Galácticos edge it.' }),
+  { kind: 'stats', data: { possession: [61, 39], shots: [13, 8], on_target: [6, 3], xg: [1.92, 1.31], corners: [7, 3], fouls: [9, 14], offsides: [2, 3], yellow: [0, 2], red: [0, 1], motm: { side: 'A', player: A[9], reason: 'Two clinical finishes and a constant threat in behind.' } } },
+  { kind: 'ratings', data: { A: A.map((p, i) => ({ player: p, rating: [7.4, 6.8, 7.0, 6.2, 6.9, 7.6, 7.1, 7.3, 7.5, 8.9, 7.8][i] })), B: B.map((p, i) => ({ player: p, rating: [7.2, 6.3, 6.6, 6.5, 6.0, 4.9, 6.4, 6.8, 6.9, 6.7, 7.4][i] })) } },
+  { kind: 'analysis', data: { side: 'A', summary: 'Patient possession with a high press and quick combinations around the box.', strengths: ['Press wins the ball high', 'Overloads the half-spaces', 'Ruthless finishing'], weaknesses: ['High line exposed by direct balls', 'Conceded a soft penalty', 'Slow to kill the game'], resembles: { club: 'Manchester City', league: 'Premier League', why: 'Positional play, inverted full-backs and a striker who lives in the box.' } } },
+  { kind: 'analysis', data: { side: 'B', summary: 'Compact and direct, dangerous on the break until the red card.', strengths: ['Fast transitions', 'Aerial threat from crosses', 'Spirited after half-time'], weaknesses: ['Indiscipline in midfield', 'Too passive without the ball', 'Isolated striker'], resembles: { club: 'Atlético Madrid', league: 'LaLiga', why: 'A deep, narrow block that springs forward through quick wide runners.' } } },
+  { kind: 'end', data: {} },
 ];
-
-const FILLER = [
-  ['possession', 'patient spell of possession, probing for an opening.'],
-  ['possession', 'switch the play from flank to flank.'],
-  ['foul', 'concede a soft free kick in midfield.'],
-  ['possession', 'press high and win it back quickly.'],
-  ['possession', 'work it out from the back under pressure.'],
-];
-
-function buildItems() {
-  const items = [{ kind: 'meta', data: { kickoff: 'A', referee: 'Clément Turpin', weather: 'Clear, 18°C', headline: 'Süper Lig all-stars collide on neutral ground' } }];
-  const keyAt = new Map();
-  KEY.forEach(k => { const key = `${k[0]}+${k[1]}`; if (!keyAt.has(key)) keyAt.set(key, []); keyAt.get(key).push(k); });
-  const names = { A: MOCK_TEAMS.A.name, B: MOCK_TEAMS.B.name };
-  const push = (min, add, type, side, player, assist, zone, text) => items.push({ kind: 'ev', data: { min, add, type, side, player, assist, zone, text } });
-  const stoppage = { 45: 3, 90: 5 };
-  for (let m = 1; m <= 90; m++) {
-    const adds = stoppage[m] ? Array.from({ length: stoppage[m] + 1 }, (_, i) => i) : [0];
-    for (const a of adds) {
-      const keys = keyAt.get(`${m}+${a}`);
-      if (keys) keys.forEach(k => push(...k));
-      else if (!(m === 46 && a === 0)) {
-        const [type, tail] = FILLER[(m * 7 + a) % FILLER.length];
-        const side = (m * 3 + a) % 5 < 3 ? 'A' : 'B';
-        const zone = ['left', 'center', 'right'][(m + a) % 3];
-        push(m, a, type, side, null, null, zone, `${names[side]} ${tail}`);
-        if (m % 6 === 0 && a === 0) push(m, 0, 'possession', side === 'A' ? 'B' : 'A', null, null, zone, `${names[side === 'A' ? 'B' : 'A']} try to slow the tempo.`);
-      }
-    }
-  }
-  items.push({ kind: 'stats', data: {
-    possession: [54, 46], shots: [14, 12], on_target: [6, 5], xg: [2.41, 2.08], corners: [6, 4], fouls: [11, 14], offsides: [3, 1], yellow: [1, 2], red: [1, 1],
-    motm: { side: 'A', player: 'Rafael Leão', reason: 'A goal and an assist, constantly isolating Singo and creating the best chances of the night.' },
-  } });
-  items.push({ kind: 'ratings', data: {
-    A: MOCK_TEAMS.A.players.map((p, i) => ({ player: p.name, rating: [6.8, 6.6, 5.1, 6.4, 6.5, 6.9, 7.2, 7.4, 8.7, 7.9, 8.1][i] })),
-    B: MOCK_TEAMS.B.players.map((p, i) => ({ player: p.name, rating: [6.9, 6.7, 6.6, 5.9, 6.3, 6.8, 5.4, 7.6, 6.9, 8.4, 7.7][i] })),
-  } });
-  items.push({ kind: 'analysis', data: {
-    side: 'A', summary: 'Explosive on the break, fragile when stretched.',
-    strengths: ['Elite transition speed through Leão and Greenwood', 'Kanté and Gündoğan control the tempo', 'Osimhen gives a constant aerial outlet'],
-    weaknesses: ['High line exposed by quick through balls', 'Centre-backs prone to rash challenges', 'Little creativity once the press is beaten'],
-    resembles: { club: 'Napoli', league: 'Serie A', why: 'Direct, vertical football built around a powerful No.9 and wide runners who attack space.' },
-  } });
-  items.push({ kind: 'analysis', data: {
-    side: 'B', summary: 'Technical and patient, but lacking legs in midfield.',
-    strengths: ['Salah and Trossard are lethal cutting inside', 'Vlahović finishes everything in the box', 'Comfortable building from Ederson'],
-    weaknesses: ['Kökçü–Ndidi pivot overrun in transition', 'Discipline: two bookings cost them a man', 'Full-backs leave space behind'],
-    resembles: { club: 'Aston Villa', league: 'Premier League', why: 'Possession-based with inverted wingers and a classic target striker leading the line.' },
-  } });
-  items.push({ kind: 'end', data: {} });
-  return items;
-}
-
-export const MOCK_ITEMS = buildItems();
