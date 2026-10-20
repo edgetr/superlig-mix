@@ -240,11 +240,14 @@ export function createMatch({ teams }) {
     const isGoal = kind === 'shot' && ev.outcome === 'goal';
     const scorerSide = ev.side;
     const climax = clip.info.climax || 0;
-    const sc = push({ kind: 'clip', clip, ev, idx, M, half, dur: Math.round(clip.dur * 1000), min, add, scoreBefore, climax, isGoal, isWipe: !opt.short, live: true });
-    if (idx >= 0) built.tl.push({ start: sc.start + Math.max(0, climax * 1000 - 300), end: sc.start + sc.dur, kind: 'ev', type: ev.type === 'shot' ? (ev.outcome === 'goal' ? (ev.ownGoal ? 'own_goal' : ev.technique === 'penalty' ? 'penalty_goal' : 'goal') : ev.outcome === 'woodwork' ? 'woodwork' : ev.outcome === 'blocked' ? 'block' : ['saved', 'parried', 'tipped'].includes(ev.outcome) ? 'save' : ev.outcome === 'disallowed' ? 'var' : 'shot') : ev.type === 'foul' ? (ev.card ? (ev.card === 'yellow' ? 'yellow' : 'red') : ev.penalty ? 'penalty' : 'foul') : ev.type, itemIndex: idx, side: ev.side || null, minute: minuteStr(min, add) });
+    // Highlights join the move a few seconds before the key moment.
+    const lead = kind === 'shot' ? (isGoal ? 9.5 : 8) : kind === 'foul' ? 6.5 : kind === 'offside' ? 6.5 : 30;
+    const trim = opt.short ? Math.max(0, Math.min(clip.dur - 8, 2)) : Math.max(0, climax - lead);
+    const sc = push({ kind: 'clip', clip, ev, idx, M, half, trimStart: trim, dur: Math.round((clip.dur - trim) * 1000), min, add, scoreBefore, climax, isGoal, isWipe: !opt.short, live: true });
+    if (idx >= 0) built.tl.push({ start: sc.start + Math.max(0, (climax - trim) * 1000 - 300), end: sc.start + sc.dur, kind: 'ev', type: ev.type === 'shot' ? (ev.outcome === 'goal' ? (ev.ownGoal ? 'own_goal' : ev.technique === 'penalty' ? 'penalty_goal' : 'goal') : ev.outcome === 'woodwork' ? 'woodwork' : ev.outcome === 'blocked' ? 'block' : ['saved', 'parried', 'tipped'].includes(ev.outcome) ? 'save' : ev.outcome === 'disallowed' ? 'var' : 'shot') : ev.type === 'foul' ? (ev.card ? (ev.card === 'yellow' ? 'yellow' : 'red') : ev.penalty ? 'penalty' : 'foul') : ev.type, itemIndex: idx, side: ev.side || null, minute: minuteStr(min, add) });
     if (isGoal) {
       st.score[scorerSide === 'B' ? 1 : 0]++;
-      sc.goalAt = sc.start + Math.round((clip.marks.goalT || climax) * 1000);
+      sc.goalAt = sc.start + Math.round(((clip.marks.goalT || climax) - trim) * 1000);
       st.goals.push({ side: scorerSide, name: ev.ownGoal ? `${ev.og} (OG)` : ev.player, min: minuteStr(min, add), pen: ev.technique === 'penalty' });
     }
     if (kind === 'foul') {
@@ -306,8 +309,9 @@ export function createMatch({ teams }) {
     st.htDone = true;
     const M = C.withHalf(M0, 1);
     const wh = await build(1, { type: 'half_time', text: ev.text }, { kind: 'whistle', seed: 77, sent: new Set(st.sent) });
-    const sc = push({ kind: 'clip', clip: wh, ev: { ...ev, type: 'half_time' }, idx, M, half: 1, dur: Math.round(wh.dur * 1000), min: 45, add: add || 0, scoreBefore: [...st.score], climax: 1.6, isWipe: true });
-    if (idx >= 0) built.tl.push({ start: sc.start + 1200, end: sc.start + sc.dur, kind: 'ev', type: 'half_time', itemIndex: idx, side: null, minute: minuteStr(45, add) });
+    const wtr = Math.max(0, (wh.info.climax || 1.6) - 2.6);
+    const sc = push({ kind: 'clip', clip: wh, ev: { ...ev, type: 'half_time' }, idx, M, half: 1, trimStart: wtr, dur: Math.round((wh.dur - wtr) * 1000), min: 45, add: add || 0, scoreBefore: [...st.score], climax: wh.info.climax || 1.6, isWipe: true });
+    if (idx >= 0) built.tl.push({ start: sc.start + 2400, end: sc.start + sc.dur, kind: 'ev', type: 'half_time', itemIndex: idx, side: null, minute: minuteStr(45, add) });
     push({ kind: 'ht', dur: 8000, score: [...st.score], stats: JSON.parse(JSON.stringify(st.ev)), goals: [...st.goals], cards: [...st.cards] });
     push({ kind: 'switch', dur: 3200 });
     st.half = 2; st.setup = null; st.lastRendered = 46;
@@ -325,9 +329,10 @@ export function createMatch({ teams }) {
     const winner = st.score[0] > st.score[1] ? 'A' : st.score[1] > st.score[0] ? 'B' : null;
     st.ftStart = 'building';
     const wh = await build(2, { type: 'full_time', winner, text: ev.text }, { kind: 'whistle', seed: 88, sent: new Set(st.sent) });
-    const sc = push({ kind: 'clip', clip: wh, ev: { ...ev, type: 'full_time' }, idx, M, half: 2, dur: Math.round(wh.dur * 1000), min: 90, add: add || 0, scoreBefore: [...st.score], climax: 1.6, isWipe: true });
-    st.ftWhistle = sc.start + 1500;
-    if (idx >= 0) built.tl.push({ start: sc.start + 1500, end: sc.start + sc.dur, kind: 'ev', type: 'full_time', itemIndex: idx, side: null, minute: minuteStr(90, add) });
+    const wtr = Math.max(0, (wh.info.climax || 1.6) - 2.6);
+    const sc = push({ kind: 'clip', clip: wh, ev: { ...ev, type: 'full_time' }, idx, M, half: 2, trimStart: wtr, dur: Math.round((wh.dur - wtr) * 1000), min: 90, add: add || 0, scoreBefore: [...st.score], climax: wh.info.climax || 1.6, isWipe: true });
+    st.ftWhistle = sc.start + 2600;
+    if (idx >= 0) built.tl.push({ start: sc.start + 2600, end: sc.start + sc.dur, kind: 'ev', type: 'full_time', itemIndex: idx, side: null, minute: minuteStr(90, add) });
     st.ftStart = 'pending';
     maybeFT();
   }
@@ -494,7 +499,7 @@ export function createMatch({ teams }) {
       const tt = clamp(ct + k * 0.1, 0, c.dur), f = Math.min(c.N - 1, Math.round(tt * HZ)), ww = 1 - Math.abs(k) / 9;
       y += c.ball[f * 3 + 1] * ww; w += ww;
     }
-    return 29 + (y / w - 34) * 0.5;
+    return 29 + (y / w - 34) * 0.7;
   }
 
   function drawClip(ctx, sc, ct, mode, opts = {}) {
@@ -654,6 +659,69 @@ export function createMatch({ teams }) {
       ctx.fillStyle = '#0b100d'; ctx.font = `italic 900 54px ${FONT}`; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
       ctx.globalAlpha = Math.sin(((p - 0.35) / 0.35) * Math.PI);
       ctx.fillText(minuteStr(sc.min, sc.add), W / 2, H / 2);
+    }
+    ctx.restore();
+  }
+  // ---------------------------------------------------------------- transitions
+  // Every cut is covered by a transition that straddles it: it starts in the outgoing scene, hides
+  // the switch at its peak and resolves in the incoming one — like a broadcast highlights package.
+  function fxFor(a, b) {
+    if (b.kind === 'clip' && b.isWipe) return { type: 'stinger', pre: 0.36, post: 0.46 };
+    if (b.kind === 'replay' || a.kind === 'replay' && b.kind !== 'freeze') return { type: 'replay', pre: 0.3, post: 0.4 };
+    if (b.kind === 'freeze') return { type: 'flash', pre: 0.06, post: 0.42 };
+    if (a.kind === 'freeze' || a.kind === 'var') return { type: 'stinger', pre: 0.36, post: 0.46 };
+    return { type: 'dip', pre: 0.24, post: 0.3 };
+  }
+  function sceneIndexAt(t) {
+    const sc = built.scenes;
+    let lo = 0, hi = sc.length - 1;
+    while (lo < hi) { const mid = (lo + hi + 1) >> 1; if (sc[mid].start <= t) lo = mid; else hi = mid - 1; }
+    return lo;
+  }
+  function transitions(ctx, t) {
+    const scs = built.scenes; if (scs.length < 2) return;
+    const i = sceneIndexAt(t);
+    const pairs = [];
+    if (i + 1 < scs.length) pairs.push([scs[i + 1].start, scs[i], scs[i + 1]]);
+    if (i > 0) pairs.push([scs[i].start, scs[i - 1], scs[i]]);
+    for (const [B, a, b] of pairs) {
+      const fx = fxFor(a, b);
+      const p = (t - (B - fx.pre * 1000)) / ((fx.pre + fx.post) * 1000);
+      if (p <= 0 || p >= 1) continue;
+      const mid = fx.pre / (fx.pre + fx.post);
+      drawFx(ctx, fx.type, p, mid, b);
+    }
+  }
+  function drawFx(ctx, type, p, mid, b) {
+    // k: 0 → 1 (fully covering) at the cut → 0
+    const k = p < mid ? p / mid : 1 - (p - mid) / (1 - mid);
+    ctx.save();
+    if (type === 'dip') {
+      ctx.fillStyle = `rgba(2,4,6,${easeInOut(Math.min(1, k * 1.05))})`; ctx.fillRect(0, 0, W, H);
+    } else if (type === 'flash') {
+      ctx.fillStyle = `rgba(255,255,255,${Math.pow(k, 1.6) * 0.9})`; ctx.fillRect(0, 0, W, H);
+    } else if (type === 'stinger' || type === 'replay') {
+      // three bands race across: they arrive (cover) before the cut and leave after it
+      const cols = type === 'replay' ? [TEAMS.B.color, '#f8fafc', TEAMS.A.color] : [TEAMS.A.color, '#f8fafc', TEAMS.B.color];
+      const span = W + 900;
+      cols.forEach((col, j) => {
+        const lag = j * 0.07;
+        let x;
+        if (p < mid) { const q = easeOut(clamp((p / mid - lag) / (1 - lag * 2), 0, 1)); x = -span * 0.5 + q * span * 0.5; }
+        else { const q = easeInOut(clamp(((p - mid) / (1 - mid) - (0.14 - lag)) / 0.86, 0, 1)); x = q * span * 0.6; }
+        const x0 = x + (j - 1) * 120;
+        ctx.fillStyle = col;
+        ctx.beginPath(); ctx.moveTo(x0 - 420, 0); ctx.lineTo(x0 + W + 120, 0); ctx.lineTo(x0 + W - 300, H); ctx.lineTo(x0 - 840, H); ctx.closePath(); ctx.fill();
+      });
+      // logo / minute on the band at full cover
+      const a = clamp(1 - Math.abs(p - mid) / 0.22, 0, 1);
+      if (a > 0) {
+        ctx.globalAlpha = a;
+        ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.lineJoin = 'round';
+        const txt = (str, size, y) => { ctx.font = `italic 900 ${size}px ${FONT}`; ctx.lineWidth = size * 0.16; ctx.strokeStyle = 'rgba(5,8,10,0.85)'; ctx.strokeText(str, W / 2, y); ctx.fillStyle = '#ffffff'; ctx.fillText(str, W / 2, y); };
+        if (type === 'replay') txt('REPLAY', 64, H / 2);
+        else { txt('SÜPER LIG MIX', 30, H / 2 - 46); if (b.min) txt(minuteStr(b.min, b.add), 80, H / 2 + 16); }
+      }
     }
     ctx.restore();
   }
@@ -1273,7 +1341,6 @@ export function createMatch({ teams }) {
           if (!goalCard) lowerThird(ctx, sc, ct);
           goalGraphic(ctx, sc, ct);
           cardGraphic(ctx, sc, ct);
-          if (sc.isWipe) wipe(ctx, local / 700, sc);
         }
         break;
       }
@@ -1286,7 +1353,6 @@ export function createMatch({ teams }) {
         ctx.fillStyle = TEAMS[sc.ev.side || 'A'].color; ctx.beginPath(); ctx.arc(W - 156, 60, 7 + Math.sin(local / 140) * 1.5, 0, Math.PI * 2); ctx.fill();
         ctx.fillStyle = '#111'; ctx.font = `900 15px ${FONT}`; ctx.textAlign = 'left'; ctx.textBaseline = 'middle'; ctx.fillText('REPLAY', W - 140, 61);
         if (!noHud) scorebug(ctx, { ...sc, goalAt: null }, t, sc.from);
-        if (local < 450) wipe(ctx, local / 450, null);
         break;
       }
       case 'freeze': drawFreeze(ctx, sc, local); break;
@@ -1301,6 +1367,7 @@ export function createMatch({ teams }) {
       case 'end': drawEnd(ctx, sc, local); break;
     }
     ctx.restore();
+    transitions(ctx, t);
   }
 
   // ---------------------------------------------------------------- public API

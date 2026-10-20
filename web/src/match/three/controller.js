@@ -183,7 +183,20 @@ export function createController(lib, body) {
         c.high = clamp(((shot?.to?.z ?? 0.8) - 0.3) / 1.8, 0, 1);
       }
     }
-    p = { inst };
+    // dribble / control touches per agent
+    const touches = Array.from({ length: A }, () => null);
+    for (const tc of clip.marks?.touches || []) (touches[tc.agent] ||= []).push(tc);
+    // jockey weight per frame, smoothed (it toggles on and off in the engine)
+    const jockey = Array.from({ length: A }, () => null);
+    for (let a = 0; a < A; a++) {
+      let any = false; const on = new Float32Array(N);
+      for (let k = 0; k < N; k++) if (clip.st[k * A + a] === S.JOCKEY) { on[k] = 1; any = true; }
+      if (!any) continue;
+      const sm = new Float32Array(N);
+      for (let k = 0; k < N; k++) { let s = 0, n = 0; for (let j = Math.max(0, k - 6); j <= Math.min(N - 1, k + 6); j++) { s += on[j]; n++; } sm[k] = s / n; }
+      jockey[a] = sm;
+    }
+    p = { inst, touches, jockey };
     prepCache.set(clip, p);
     return p;
   }
@@ -340,7 +353,6 @@ export function createController(lib, body) {
         crouch(act, 0.18 * (1 - push), 0.06, 0.25 * (1 - fly));
         const roll = side * -((1.05 + 0.35 * hi) * fly + (1.45 - (1.05 + 0.35 * hi)) * land);
         rotateBone(act, 0, 0, 0, 1, roll);
-        act.r[0] += side * (0.25 * fly + 0.2 * land);
         act.r[1] = act.r[1] * (1 - fly) + (0.75 + 0.55 * hi) * fly * (1 - land) + 0.17 * land;
         // arms stretched along the body towards the ball, legs extended the other way
         const th = Math.abs(roll), sn = Math.sin(th), cs = Math.cos(th);
@@ -463,6 +475,38 @@ export function createController(lib, body) {
         arms(act, null, null, [-0.55, 0.25, 0.8], [-0.5, 0.3, 0.82], r);
         return { w: envelope(0.15, 0.3), upper: true };
       }
+      case S.WALLJUMP: {
+        // jump straight up on the spot, hands protecting
+        const clip = C.jump; if (!clip) return null;
+        const rate = 1.5, ap = c.t0 + 0.3;
+        sampleAction(clip, clamp(clip.ref + (t - ap) * rate, 0, clip.dur - 0.01), act);
+        arms(act, [0.15, -0.9, 0.35], [-0.6, -0.35, 0.72], [-0.15, -0.9, 0.35], [0.6, -0.35, 0.72]);
+        return { w: smooth((t - (ap - clip.ref / rate)) / 0.15) * smooth((c.t1 + 0.3 - t) / 0.3) };
+      }
+      case S.CALL: {
+        // arm up, asking for it
+        copyPose(act, base);
+        const r = smooth(u / 0.18) * (1 - smooth((u - dur + 0.15) / 0.2)), wav = Math.sin(u * 9) * 0.1;
+        if (c.seed < 0.5) arms(act, null, null, [-0.2 + wav, 0.95, 0.25], [-0.1 + wav, 1, 0.15], r);
+        else arms(act, [0.2 - wav, 0.95, 0.25], [0.1 - wav, 1, 0.15], null, null, r);
+        return { w: 1, upper: true };
+      }
+      case S.CATCH: {
+        // keeper gets his body behind it and gathers it in
+        idlePose(act, t, a);
+        const q = smooth(u / 0.2);
+        crouch(act, 0.22 * q, 0.04, 0.4 * q);
+        arms(act, [0.25, -0.6, 0.75], [-0.3, 0.05, 0.95], [-0.25, -0.6, 0.75], [0.3, 0.05, 0.95], q);
+        return { w: envelope(0.12, 0.3) };
+      }
+      case S.CHEST: {
+        copyPose(act, base);
+        const q = Math.sin(clamp(u / 0.6, 0, 1) * Math.PI);
+        rotateBone(act, I.Spine1, 1, 0, 0, -0.35 * q);
+        rotateBone(act, I.Neck, 1, 0, 0, 0.3 * q);
+        arms(act, [0.95, 0.05, 0.1], [0.9, 0.2, 0.2], [-0.95, 0.05, 0.1], [-0.9, 0.2, 0.2], q);
+        return { w: 1, upper: true };
+      }
       default: return null;
     }
   }
@@ -517,6 +561,28 @@ export function createController(lib, body) {
     // Leans: into turns (roll) and with acceleration (pitch).
     rotateBone(base, 0, 0, 0, 1, clamp(yawRate * sp * 0.035, -0.35, 0.35));
     rotateBone(base, 0, 1, 0, 0, clamp(acc * 0.025, -0.12, 0.15));
+    // Jockeying defender: low, side-on, arms out for balance (over his own footwork)
+    const jk = prep.jockey[a];
+    if (jk) {
+      const f = clamp(t * HZ, 0, N - 1) | 0, on = clip.st[f * N_AGENTS + a] === S.JOCKEY;
+      const wj = jk[f] ?? (on ? 1 : 0);
+      if (wj > 0.01) {
+        crouch(base, 0.1 * wj, 0, 0.22 * wj);
+        arms(base, [0.85, -0.45, 0.25], [0.7, -0.2, 0.55], [-0.85, -0.45, 0.25], [-0.7, -0.2, 0.55], wj * 0.8);
+      }
+    }
+    // Touches on the ball: the foot flicks out to meet it
+    const tl = prep.touches[a];
+    if (tl) {
+      for (let k = 0; k < tl.length; k++) {
+        const dtt = t - tl[k].t;
+        if (dtt < -0.2 || dtt > 0.25) continue;
+        const g = Math.exp(-Math.pow((dtt + 0.02) / 0.09, 2));
+        const leg = I[(look?.foot === 'left' ? 'Left' : 'Right') + 'UpLeg'], knee = I[(look?.foot === 'left' ? 'Left' : 'Right') + 'Leg'];
+        rotateBone(base, leg, 1, 0, 0, -0.42 * g * (tl[k].kind === 'control' ? 0.8 : 1));
+        rotateBone(base, knee, 1, 0, 0, 0.2 * g);
+      }
+    }
     copyPose(pose, base);
 
     // Actions
@@ -535,13 +601,13 @@ export function createController(lib, body) {
         const toe = (look?.foot === 'left') ? m.toe : m.right;
         const [ex, ey] = charToEngine(toe.x, toe.z, c.hd);
         let sx = c.ball.x - (c.pos.x + ex), sy = c.ball.y - (c.pos.y + ey);
-        const l = Math.hypot(sx, sy); if (l > 0.9) { sx *= 0.9 / l; sy *= 0.9 / l; }
+        const l = Math.hypot(sx, sy); if (l > 0.5) { sx *= 0.5 / l; sy *= 0.5 / l; }
         const g = Math.exp(-Math.pow((t - c.anchor) / 0.32, 2)) * ac.w;
         dx += sx * g; dy += sy * g;
       } else if (ac.shift === 'head') {
         const [ex, ey] = charToEngine(0, 0.12, c.hd);
         let sx = c.ball.x - (c.pos.x + ex), sy = c.ball.y - (c.pos.y + ey);
-        const l = Math.hypot(sx, sy); if (l > 0.8) { sx *= 0.8 / l; sy *= 0.8 / l; }
+        const l = Math.hypot(sx, sy); if (l > 0.45) { sx *= 0.45 / l; sy *= 0.45 / l; }
         const g = Math.exp(-Math.pow((t - c.anchor) / 0.3, 2)) * ac.w;
         dx += sx * g; dy += sy * g;
       }

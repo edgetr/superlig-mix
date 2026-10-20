@@ -17,7 +17,7 @@ export function camera(pos, look, fovDeg) {
   return { pos, look, fov: fovDeg, fwd, right, up, f };
 }
 // Main TV camera: high in the stand on the near touchline, panning with play.
-export function broadcastCam(x, zoom = 1, ly = 29) { return camera([x, WD + 48, 29], [x, ly, 0], 22 / zoom); }
+export function broadcastCam(x, zoom = 1, ly = 29) { return camera([x, WD + 48, 29], [x, ly, 0], 17.5 / zoom); }
 // Replay: low behind the goal the attack is heading to.
 export function behindGoalCam(goalX, y = 34) {
   const s = goalX > L / 2 ? 1 : -1;
