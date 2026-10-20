@@ -37,3 +37,13 @@ Quaternions are stored as Int16, root positions in millimetres.
 The CMU data is free for use in research and products (not for resale as a motion library).
 *The data used in this project was obtained from mocap.cs.cmu.edu. The database was created with
 funding from NSF EIA-0196217.*
+
+## Face landmarks on the head
+
+`build_body.mjs` also writes the head texture atlas (`headUV`: MakeHuman's own UV islands for the
+head and ears, repacked into [0,1]², seam vertices split) and the eyeball region used by the face
+pipeline (`web/src/match/three/face.js`). `web/public/models/face_fit.json` holds the 478 MediaPipe
+Face Mesh landmarks located on this head: open `face-lab.html?fit` with the dev server, which renders
+the bare head from the front, runs the Face Landmarker on it (averaged over a few skin tones and
+lights), ray-casts every landmark onto the mesh and leaves `{ points, normals }` in `window.__fit`.
+Re-run it only if the head geometry changes.

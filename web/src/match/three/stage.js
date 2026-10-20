@@ -8,6 +8,7 @@ import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment
 import { L, WD, GOAL_W, GOAL_H, POST_A, POST_B, HZ, N_AGENTS, S } from '../../sim/core.js';
 import { loadAssets, makeSkeleton } from './assets.js';
 import { createKitMaterial, numberTexture } from './kit.js';
+import { createFaces } from './face.js';
 import { createController } from './controller.js';
 
 const ASPECT = 16 / 9;
@@ -186,30 +187,46 @@ async function createStage() {
   }
 
   // ---------------------------------------------------------------- per-match cast (kits, faces)
-  let castKey = null;
-  const faceTex = new Map();
+  // Faces are baked once per photo (face.js): head texture, head shape, hair volume and colours.
+  const faces = createFaces(renderer, body);
+  let castKey = null, cast = null;
+  const eyeL0 = people[0].u.uEyeL.value.clone(), eyeR0 = people[0].u.uEyeR.value.clone();
+  function applyHead(a) {
+    const lk = cast.looks[a], p = people[a], u = p.u;
+    const img = lk.id != null ? cast.photos?.get?.(lk.id) : null;
+    const f = img && !globalThis.__noFaces ? faces.get(img) : null;   // __noFaces: A/B testing
+    if (f) {
+      u.uFace.value = f.tex; u.uFaceHi.value = f.texHi; u.uHasFace.value = 1;
+      u.uSkin.value.copy(f.skin); u.uHair.value.copy(f.hair); u.uHasHair.value = f.hasHair ? 1 : 0;
+      u.uHairTop.value = f.hairTop; u.uHairSide.value = f.hairSide;
+      u.uIris.value.copy(f.iris); u.uSclera.value.copy(f.sclera);
+      u.uEyeL.value.copy(f.eyes[0]); u.uEyeR.value.copy(f.eyes[1]);
+      p.mesh.geometry = f.geo;
+      return;
+    }
+    u.uHasFace.value = 0; p.mesh.geometry = body.geo;
+    u.uSkin.value.set(lk.skin || '#c8956b'); u.uHasHair.value = lk.hair ? 1 : 0; if (lk.hair) u.uHair.value.set(lk.hair);
+    u.uHairTop.value = 0.012; u.uHairSide.value = 0.006;
+    u.uIris.value.set('#3a2416'); u.uSclera.value.set('#d9d2cb');
+    u.uEyeL.value.copy(eyeL0); u.uEyeR.value.copy(eyeR0);
+    // Photo not analysed yet: do it now, the head updates when it's ready.
+    if (img && !faces.has(img)) faces.prepare([img]).then(() => { const cur = cast?.looks[a]; if (cur && cast.photos?.get?.(cur.id) === img) applyHead(a); });
+  }
   function setCast(key, looks, photos, teamNames) {
     if (key === castKey) return;
     castKey = key;
+    cast = { looks, photos };
     for (let a = 0; a < N_AGENTS; a++) {
       const lk = looks[a], p = people[a], u = p.u;
       u.uShirt.value.set(lk.shirt); u.uShirt2.value.set(lk.shirt2 || lk.trim || '#ffffff');
       u.uShorts.value.set(lk.shorts); u.uSocks.value.set(lk.socks); u.uBoots.value.set(lk.boots || '#111111');
-      u.uSkin.value.set(lk.skin || '#c8956b'); u.uHasHair.value = lk.hair ? 1 : 0; if (lk.hair) u.uHair.value.set(lk.hair);
       u.uNumCol.value.set(lk.numColor || '#ffffff'); u.uTrim.value.set(/^#/.test(lk.trim || '') ? lk.trim : lk.numColor || '#ffffff');
       u.uSleeve.value = lk.longSleeve ? 0.985 : 0.27;
       u.uHasGlove.value = lk.gloves ? 1 : 0; if (lk.gloves) u.uGlove.value.set(lk.gloves);
       u.uPattern.value = lk.pattern || 0;
       if (lk.num != null) { u.uNum.value?.dispose?.(); u.uNum.value = numberTexture(lk.num, lk.backName || surname(lk.name)); u.uHasNum.value = 1; }
       else u.uHasNum.value = 0;
-      const img = lk.id != null ? photos?.get?.(lk.id) : null;
-      if (img) {
-        let t = faceTex.get(img);
-        if (!t) { t = new THREE.Texture(img); t.colorSpace = THREE.SRGBColorSpace; t.anisotropy = 4; t.needsUpdate = true; faceTex.set(img, t); }
-        u.uFace.value = t; u.uHasFace.value = 1;
-        const xf = lk.faceXf || [0.86, 0.07, 0.78, 0.14];
-        u.uFaceXf.value.set(xf[0], xf[1], xf[2], xf[3]);
-      } else u.uHasFace.value = 0;
+      applyHead(a);
       const h = lk.height || 1.8;
       p.g.scale.setScalar(h / body.height);
     }
@@ -217,6 +234,13 @@ async function createStage() {
       const c = makeBoardCanvas(teamNames.texts, teamNames.colors);
       boardTex.image = c; boardTex.needsUpdate = true;
     }
+  }
+  // Analyse and bake every photo up front (call while the line-ups are on screen).
+  async function prepareFaces(photos) {
+    const imgs = [...(photos?.values?.() || [])];
+    faces.retain(new Set(imgs), new Set(people.map(p => p.u.uFace.value)));
+    await faces.prepare(imgs);
+    if (cast) for (let a = 0; a < N_AGENTS; a++) applyHead(a);
   }
 
   // ---------------------------------------------------------------- per-frame
@@ -319,7 +343,8 @@ async function createStage() {
   }
   warm();
 
-  return { draw, setCast, renderer, canvas, scene, people, ctrl, body, lib };
+  const refreshHeads = () => { if (cast) for (let a = 0; a < N_AGENTS; a++) applyHead(a); };
+  return { draw, setCast, prepareFaces, refreshHeads, faces, renderer, canvas, scene, people, ctrl, body, lib };
 }
 
 const surname = n => { const p = String(n || '').trim().split(/\s+/); return p.length > 1 ? p.slice(-1)[0] : p[0] || ''; };

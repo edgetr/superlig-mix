@@ -9,6 +9,9 @@ const G = 9.81;
 const KD = 0.0135;                // drag: a = −KD·|v|·v   (½ρ·Cd·A / m for a size-5 ball)
 const KM = 0.0055;                // Magnus: a = KM · (ω × v)
 const ROLL = 0.75;                // rolling resistance on grass (m/s²)
+const ROLL_V = 0.035;             // grass drag on a rolling ball grows with speed (1/s)
+const MU_SLIDE = 0.32;            // sliding friction ball/grass while it skids
+const SHELL = 1.5;                // 1 / (I/mR²) for a thin shell: I = ⅔ m R²
 const BOUNCE = 0.55;              // vertical restitution
 const SUB = 1 / 240;              // integration step
 const POST_R = 0.06;
@@ -29,10 +32,22 @@ export function stepBall(b, dt, ev = null) {
     az += KM * (b.wx * b.vy - b.wy * b.vx);
     if (onGround) {
       az = 0; b.vz = 0; b.z = R;
+      // Contact patch: a ball struck without topspin skids (its bottom slides over the grass)
+      // until friction has spun it up to rolling — a touched or passed ball loses pace quickly
+      // at first, then rolls on. Slip velocity of the contact point: v + ω × (−R ẑ).
+      const ux = b.vx - R * b.wy, uy = b.vy + R * b.wx, us = Math.hypot(ux, uy);
       const hs = Math.hypot(b.vx, b.vy);
-      if (hs < 0.04) { b.vx = b.vy = 0; ax = ay = 0; }
-      else { ax -= (ROLL * b.vx) / hs; ay -= (ROLL * b.vy) / hs; }
-      const k = Math.exp(-4 * h); b.wx *= k; b.wy *= k; b.wz *= k;   // grass kills spin
+      if (us > 0.06) {
+        const f = MU_SLIDE * G;
+        ax -= (f * ux) / us; ay -= (f * uy) / us;
+        b.wy += ((SHELL * f * ux) / us / R) * h; b.wx -= ((SHELL * f * uy) / us / R) * h;
+      } else if (hs < 0.04) { b.vx = b.vy = 0; ax = ay = 0; b.wx = b.wy = 0; }
+      else {
+        const dec = ROLL + ROLL_V * hs;
+        ax -= (dec * b.vx) / hs; ay -= (dec * b.vy) / hs;
+        b.wy = b.vx / R; b.wx = -b.vy / R;            // rolling: spin locked to speed
+      }
+      b.wz *= Math.exp(-4 * h);                       // the grass kills sidespin
     } else {
       az -= G;
       const k = Math.exp(-0.08 * h); b.wx *= k; b.wy *= k; b.wz *= k;

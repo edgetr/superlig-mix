@@ -3,6 +3,7 @@
 // skin weights from MPFB2 (all CC0). Motion: CMU Graphics Lab Motion Capture Database takes,
 // retargeted offline to that skeleton (tools/mocap). See README › Credits.
 import * as THREE from 'three';
+import { defaultHair, faceFrame } from './headModel.js';
 
 const BASE = `${import.meta.env?.BASE_URL || '/'}models/`;
 let loading = null;
@@ -32,12 +33,20 @@ function makeBody(meta, buf) {
   geo.setAttribute('region', new THREE.BufferAttribute(view(buf, L.region), 1));
   geo.setAttribute('armT', new THREE.BufferAttribute(view(buf, L.armT), 1));
   geo.setAttribute('legT', new THREE.BufferAttribute(view(buf, L.legT), 1));
+  // Head atlas UV (−1: not on the atlas, −2: mouth interior) and hair weight (default cap; faces
+  // baked from photos get their own per-player hair weights, see face.js).
+  const nV = L.position.length / 3;
+  geo.setAttribute('headUV', new THREE.BufferAttribute(L.headUV ? view(buf, L.headUV) : new Float32Array(nV * 2).fill(-1), 2));
+  geo.setAttribute('hairW', new THREE.BufferAttribute(new Float32Array(nV), 1));
   geo.setIndex(new THREE.BufferAttribute(view(buf, L.index), 1));
   geo.computeBoundingSphere();
   geo.boundingSphere.radius = 2.2; // posed limbs reach further than the rest pose
   const bones = meta.bones;
   const idx = Object.fromEntries(bones.map((b, i) => [b.name, i]));
-  return { geo, bones, idx, head: meta.head, height: meta.height };
+  const out = { geo, bones, idx, head: meta.head, eyes: meta.eyes, height: meta.height };
+  geo.attributes.hairW.array.set(defaultHair(out));
+  geo.setAttribute('faceUVW', new THREE.BufferAttribute(faceFrame(out), 3));
+  return out;
 }
 
 // Skeleton instance: THREE.Bone hierarchy whose rest frames are world-aligned (identity rotations).

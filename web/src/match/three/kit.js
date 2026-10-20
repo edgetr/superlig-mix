@@ -1,19 +1,25 @@
 // Player material: one skinned body, dressed per player in the shader — shirt (sleeve length,
-// name + number on the back), shorts, socks, boots, goalkeeper gloves, skin and hair tones, and
-// the player's real face projected from his photo onto the front of the head.
+// name + number on the back), shorts, socks, boots, goalkeeper gloves, skin tone, and the head:
+// a per-player texture baked from his photo (face, hairline, hair — see face.js) laid out on the
+// head's UV atlas, shaded eyeballs, and hair volume from a per-vertex hair weight.
 import * as THREE from 'three';
 
 const VERT_DECL = /* glsl */`
-uniform float uSleeve, uShortsLen, uSockTop, uWaist, uHasHair, uHairVol;
-uniform vec4 uHead;
+uniform float uSleeve, uShortsLen, uSockTop, uWaist, uHasHair, uHairTop, uHairSide;
 attribute float region;
 attribute float armT;
 attribute float legT;
+attribute vec2 headUV;
+attribute vec3 faceUVW;
+attribute float hairW;
+varying vec3 vFace;
 varying vec3 vRest;
 varying vec3 vRestN;
 flat varying float vRegion;
 varying float vArm;
 varying float vLeg;
+varying vec2 vHeadUV;
+varying float vHairW;
 // Kit cloth sits a little off the skin: shirt ~1 cm, shorts ~2.5 cm (loose), socks ~0.4 cm.
 float clothInflate(float region, vec3 p, float arm, float leg) {
   float r = floor(region + 0.5);
@@ -29,15 +35,10 @@ float clothInflate(float region, vec3 p, float arm, float leg) {
   }
   if (r > 1.5 && r < 2.5) return arm < uSleeve ? 0.012 : 0.0;
   if (r > 2.5 && r < 3.5) return leg < uShortsLen ? 0.026 * (1.0 - smoothstep(uShortsLen - 0.12, uShortsLen, leg) * 0.35) : (leg > uSockTop ? 0.004 : 0.0);
+  if (r > 4.5) return 0.0;
   if (r > 3.5) return p.y < 0.11 ? 0.006 : 0.004;
-  // Hair has volume: the scalp is pushed out where the hair cap is (thicker on top).
-  if (r < 0.5 && uHasHair > 0.5) {
-    float v = (p.y - uHead.x) / (uHead.y - uHead.x);
-    float back = smoothstep(0.15, -0.55, normal.z);
-    float cap = mix(0.80, 0.42, back);
-    float h = smoothstep(cap - 0.06, cap + 0.08, v);
-    return h * uHairVol * (0.55 + 0.45 * smoothstep(0.85, 1.0, v));
-  }
+  // Hair has volume: the scalp is pushed out where the hair is (thicker on top).
+  if (r < 0.5) return hairW * uHasHair * mix(uHairSide, uHairTop, smoothstep(0.1, 0.85, normal.y));
   return 0.0;
 }
 `;
@@ -47,33 +48,48 @@ varying vec3 vRestN;
 flat varying float vRegion;
 varying float vArm;
 varying float vLeg;
-uniform vec3 uShirt, uShirt2, uShorts, uSocks, uBoots, uSkin, uHair, uNumCol, uGlove, uTrim;
+varying vec2 vHeadUV;
+varying float vHairW;
+varying vec3 vFace;
+uniform vec3 uShirt, uShirt2, uShorts, uSocks, uBoots, uSkin, uHair, uNumCol, uGlove, uTrim, uIris, uSclera;
 uniform float uSleeve, uShortsLen, uSockTop, uWaist, uNeckY, uHasHair, uHasGlove, uHasFace, uPattern, uHasNum;
-uniform vec4 uHead;     // chin y, top y, half width, front z (rest metres)
-uniform vec4 uFaceXf;   // photo mapping: u scale, u offset, v scale, v offset
+uniform vec4 uEyeL, uEyeR; // eyeball centre (rest metres) + radius
 uniform sampler2D uNum;
-uniform sampler2D uFace;
+uniform sampler2D uFace;   // baked head atlas (rgb albedo, a = 0.5 + hair / 2)
+uniform sampler2D uFaceHi; // baked front view of the face (same content, higher resolution)
 
 float edgeAA(float x, float e) { float w = fwidth(x) * 1.25 + 1e-4; return smoothstep(e - w, e + w, x); }
 
 vec3 headColor(inout float rough) {
-  float v = (vRest.y - uHead.x) / (uHead.y - uHead.x);
-  float u = 0.5 + vRest.x / (2.0 * uHead.z);
-  vec3 c = uSkin;
-  // Hair cap: lower towards the back of the head.
-  float back = smoothstep(0.15, -0.55, vRestN.z);
-  float cap = mix(0.80, 0.42, back);
-  float hair = uHasHair * smoothstep(cap - 0.04, cap + 0.04, v);
-  c = mix(c, uHair, hair);
-  rough = mix(0.5, 0.75, hair);
-  if (uHasFace > 0.5) {
-    vec2 puv = vec2(u * uFaceXf.x + uFaceXf.y, v * uFaceXf.z + uFaceXf.w);
-    vec4 ph = texture2D(uFace, clamp(puv, 0.0, 1.0));
-    float inside = step(0.0, puv.x) * step(puv.x, 1.0) * step(0.0, puv.y) * step(puv.y, 1.0);
-    float front = smoothstep(0.02, 0.42, vRestN.z) * smoothstep(-0.04, 0.06, v) * inside * ph.a;
-    c = mix(c, ph.rgb, front);
-    rough = mix(rough, 0.6, front);
+  // Mouth interior (behind the lips).
+  if (vHeadUV.x < -1.5) { rough = 0.6; return uSkin * vec3(0.32, 0.16, 0.15); }
+  if (uHasFace > 0.5 && vHeadUV.x > -0.5) {
+    vec4 t = texture2D(uFace, vHeadUV);
+    if (vFace.z > 0.001) t = mix(t, texture2D(uFaceHi, vFace.xy), vFace.z);
+    float hair = clamp(t.a * 2.0 - 1.0, 0.0, 1.0);
+    rough = mix(0.52, 0.78, hair);
+    return t.rgb;
   }
+  float hair = vHairW * uHasHair;
+  rough = mix(0.52, 0.78, hair);
+  return mix(uSkin, uHair, hair);
+}
+
+// Eyeball: wet sclera, iris with radial fibres and a dark limbal ring, pupil (looking along +z).
+vec3 eyeColor(inout float rough) {
+  vec4 e = vRest.x > 0.0 ? uEyeL : uEyeR;
+  vec3 d = normalize(vRest - e.xyz);
+  float a = acos(clamp(d.z, -1.0, 1.0));
+  float ang = atan(d.y, d.x);
+  float fib = 0.85 + 0.15 * sin(ang * 23.0 + sin(ang * 7.0) * 2.0);
+  float rI = 0.56, rP = 0.2;
+  float iris = 1.0 - edgeAA(a, rI);
+  float pupil = 1.0 - edgeAA(a, rP);
+  vec3 irisC = uIris * fib * mix(1.0, 0.45, smoothstep(rI - 0.14, rI, a)) * mix(0.8, 1.15, smoothstep(rP, rP + 0.12, a));
+  vec3 scl = uSclera * mix(1.0, 0.82, smoothstep(0.9, 1.6, a));
+  vec3 c = mix(scl, irisC, iris);
+  c = mix(c, vec3(0.012), pupil);
+  rough = 0.12;
   return c;
 }
 
@@ -91,6 +107,8 @@ vec3 kitColor(out float rough) {
   vec3 c = uSkin; rough = 0.5;
   if (r < 0.5) {
     c = headColor(rough);
+  } else if (r > 4.5) {
+    c = eyeColor(rough);
   } else if (r < 1.5) {
     float nd = length(vec2(vRest.x, vRest.z - 0.0)) - mix(0.072, 0.085, step(0.0, vRest.z));
     float shirt = 1.0 - (1.0 - edgeAA(nd, 0.0)) * edgeAA(vRest.y, uNeckY - 0.05);
@@ -152,18 +170,19 @@ export function createKitMaterial(body) {
     uGlove: { value: col('#f1f5f9') }, uTrim: { value: col('#ffffff') },
     uSleeve: { value: 0.27 }, uShortsLen: { value: 0.33 }, uSockTop: { value: 0.56 },
     uWaist: { value: 0.97 }, uNeckY: { value: 1.455 },
-    uHasHair: { value: 1 }, uHairVol: { value: 0.012 }, uHasGlove: { value: 0 }, uHasFace: { value: 0 }, uPattern: { value: 0 }, uHasNum: { value: 0 },
-    uHead: { value: new THREE.Vector4(body.head.chin, body.head.top, (body.head.x1 - body.head.x0) / 2, body.head.front) },
-    uFaceXf: { value: new THREE.Vector4(1, 0, 1, 0) },
+    uHasHair: { value: 1 }, uHairTop: { value: 0.012 }, uHairSide: { value: 0.006 }, uHasGlove: { value: 0 }, uHasFace: { value: 0 }, uPattern: { value: 0 }, uHasNum: { value: 0 },
+    uIris: { value: col('#3a2416') }, uSclera: { value: col('#d9d2cb') },
+    uEyeL: { value: eyeVec(body, 0) }, uEyeR: { value: eyeVec(body, 1) },
+    uFaceXf: { value: new THREE.Vector4(1, 0, 1, 0) }, // unused (old planar photo mapping), kept for the labs
     uNum: { value: blankTex },
-    uFace: { value: blankTex },
+    uFace: { value: blankTex }, uFaceHi: { value: blankTex },
   };
   const m = new THREE.MeshStandardMaterial({ roughness: 0.7, metalness: 0 });
   m.userData.uniforms = u;
   m.onBeforeCompile = sh => {
     Object.assign(sh.uniforms, u);
     sh.vertexShader = VERT_DECL + sh.vertexShader.replace('#include <begin_vertex>', `#include <begin_vertex>
-      vRest = position; vRestN = normal; vRegion = region; vArm = armT; vLeg = legT;
+      vRest = position; vRestN = normal; vRegion = region; vArm = armT; vLeg = legT; vHeadUV = headUV; vHairW = hairW; vFace = faceUVW;
       transformed += normal * clothInflate(region, position, armT, legT);`);
     sh.fragmentShader = FRAG_DECL + sh.fragmentShader
       .replace('#include <color_fragment>', `#include <color_fragment>
@@ -171,8 +190,13 @@ export function createKitMaterial(body) {
       .replace('#include <roughnessmap_fragment>', `#include <roughnessmap_fragment>
         roughnessFactor = kitRough;`);
   };
-  m.customProgramCacheKey = () => 'kit-v7';
+  m.customProgramCacheKey = () => 'kit-v9';
   return m;
+}
+
+function eyeVec(body, k) {
+  const e = body.eyes?.[k] || { c: [k ? -0.03 : 0.03, 1.62, 0.12], r: 0.0158 };
+  return new THREE.Vector4(e.c[0], e.c[1], e.c[2], e.r);
 }
 
 const blankTex = (() => { const t = new THREE.DataTexture(new Uint8Array([0, 0, 0, 0]), 1, 1); t.needsUpdate = true; return t; })();

@@ -175,6 +175,20 @@ export function createController(lib, body) {
         const dist = pass ? Math.hypot(pass.target.x - c.ball.x, pass.target.y - c.ball.y) : 0;
         c.kind = isShot ? 'shot' : pass && (pass.loft || dist > 30) ? 'long' : 'pass';
       }
+      // physical jumps (engine hip height): takeoff, landing, back on his feet
+      if (clip.z && (c.st === S.DIVE_L || c.st === S.DIVE_R || c.st === S.WALLJUMP || c.st === S.HEAD)) {
+        const Z = k2 => clip.z[k2 * A + a];
+        let tk = -1, ld = -1, up = -1;
+        for (let k2 = Math.max(1, c.k0 - 6); k2 < Math.min(N, c.k1 + 90); k2++) {
+          const z = Z(k2);
+          if (tk < 0) { if (Math.abs(z) > 0.004) tk = k2; continue; }
+          if (ld < 0) { if (k2 > tk + 2 && Math.abs(z - Z(k2 - 1)) < 1e-4) ld = k2; continue; }
+          if (z >= -0.004) { up = k2; break; }
+        }
+        if (tk >= 0) c.takeoff = tk / HZ;
+        if (ld >= 0) c.land = ld / HZ;
+        c.upAt = up >= 0 ? up / HZ : null;
+      }
       if (c.st === S.DIVE_L || c.st === S.DIVE_R) {
         // Dive side relative to the keeper's facing; height from the shot.
         const dy = c.st === S.DIVE_L ? -1 : 1;
@@ -204,6 +218,7 @@ export function createController(lib, body) {
   // ---------------------------------------------------------------- locomotion
   const tmpA = makePose(B), tmpB = makePose(B), tmpC = makePose(B), act = makePose(B), base = makePose(B);
   function idlePose(out, t, a) { const idle = C.idle; return sampleAction(idle, (t + a * 1.37) % idle.dur, out); }
+  const REST_Y = (() => { idlePose(tmpA, 0, 0); return tmpA.r[1]; })();
   // Strides per gait cycle of the directional captures vs the engine's forward gait table,
   // so their feet plant at the engine's gait phase too.
   const K_SIDE = C.side_l ? cycleLen(C.side_l.speed) / (C.side_l.speed * C.side_l.dur) : 1;
@@ -290,6 +305,32 @@ export function createController(lib, body) {
     rotateBone(p, I.Neck, 1, 0, 0, -0.25);
   };
 
+  // Engine hip height (jumps, dives) at time t.
+  let curClip = null;
+  function zOf(clip, a, t) {
+    if (!clip?.z) return 0;
+    const f = clamp(t * HZ, 0, clip.N - 1), i = Math.floor(f), j = Math.min(i + 1, clip.N - 1), u = f - i;
+    return clip.z[i * N_AGENTS + a] * (1 - u) + clip.z[j * N_AGENTS + a] * u;
+  }
+  // A keeper at full stretch: rolled onto his side towards the ball (fly 0→1), hands leading,
+  // legs trailing; `lie`: down on the turf. Hips at standing height + z.
+  function diveFrame(pose, t, a, side, hi, fly, lie, z) {
+    idlePose(pose, t, a);
+    crouch(pose, 0.12 * (1 - fly), 0.06, 0.2 * (1 - fly));
+    const full = 1.2 + 0.25 * hi;
+    const roll = side * -(full * fly + (1.5 - full) * lie);
+    rotateBone(pose, 0, 0, 0, 1, roll);
+    pose.r[1] = Math.max(0.15, REST_Y - 0.12 * (1 - fly) + z - 0.16 * lie);
+    const th = Math.abs(roll), sn = Math.sin(th), cs = Math.cos(th);
+    // arms stretched along the body towards the ball (top hand a little higher for high balls)
+    const up = [side * sn * (0.9 + 0.1 * hi), cs, 0.3 - 0.1 * lie], up2 = [side * sn * 0.85, cs, 0.45 - 0.15 * lie];
+    arms(pose, up, up, up2, up2, Math.max(fly, 0.4));
+    // legs: the take-off leg drives, the other trails; tucked a little on landing
+    aim(pose, I.LeftUpLeg, -side * sn + 0.05, -cs, 0.12 + 0.15 * lie, fly * 0.75);
+    aim(pose, I.RightUpLeg, -side * sn - 0.05, -cs, -0.08 + 0.2 * lie, fly * 0.75);
+    rotateBone(pose, I.Neck, 1, 0, 0, -0.15 * fly);
+  }
+
   // Each action returns a pose into `act` and its blend weight; or null when inactive.
   function actionPose(c, t, look, ballPt, a) {
     const lefty = look?.foot === 'left';
@@ -318,6 +359,7 @@ export function createController(lib, body) {
         const rate = 1.45, pre = clip.ref / rate, post = (clip.dur - clip.ref) / rate;
         if (t < c.anchor - pre || t > c.anchor + post) return null;
         sampleAction(clip, clip.ref + (t - c.anchor) * rate, act);
+        if (c.takeoff != null) act.r[1] = Math.min(act.r[1], REST_Y);   // height comes from the engine
         // Head snaps through the ball
         const snap = Math.exp(-Math.pow((t - c.anchor) / 0.09, 2));
         rotateBone(act, I.Spine1, 1, 0, 0, 0.35 * snap - 0.15 * smooth((c.anchor - t) / 0.25));
@@ -346,22 +388,23 @@ export function createController(lib, body) {
       }
       case S.DIVE_L: case S.DIVE_R: {
         if (u < -0.15) return null;
-        idlePose(act, t, a);
         const side = c.side, hi = c.high;
-        const push = smooth(u / 0.22), fly = smooth((u - 0.12) / 0.35), land = smooth((u - 0.62) / 0.35);
-        // set → spring → full stretch → land on the side
-        crouch(act, 0.18 * (1 - push), 0.06, 0.25 * (1 - fly));
-        const roll = side * -((1.05 + 0.35 * hi) * fly + (1.45 - (1.05 + 0.35 * hi)) * land);
-        rotateBone(act, 0, 0, 0, 1, roll);
-        act.r[1] = act.r[1] * (1 - fly) + (0.75 + 0.55 * hi) * fly * (1 - land) + 0.17 * land;
-        // arms stretched along the body towards the ball, legs extended the other way
-        const th = Math.abs(roll), sn = Math.sin(th), cs = Math.cos(th);
-        const up = [side * sn, cs, 0.3], up2 = [side * sn * 0.9, cs, 0.45];
-        arms(act, up, up, up2, up2, fly);
-        aim(act, I.LeftUpLeg, -side * sn + 0.05, -cs, 0.12, fly * 0.7);
-        aim(act, I.RightUpLeg, -side * sn - 0.05, -cs, -0.08, fly * 0.7);
-        const w = smooth((u + 0.15) / 0.15) * smooth((c.t1 + 0.4 - t) / 0.4);
-        return { w };
+        const tk = c.takeoff ?? c.t0, z = zOf(curClip, a, t);
+        const ua = t - tk;
+        // lying → back up: the get-up capture, paced by the engine's hips coming back up
+        if (c.land != null && t > c.t1 && c.upAt != null && t > c.land) {
+          const span = Math.max(0.3, c.upAt - c.t1), q = clamp((t - c.t1) / span, 0, 1);
+          diveFrame(act, t, a, side, hi, 1, 1, -0.62);
+          if (C.getup) { sampleAction(C.getup, q * C.getup.dur * 0.98, tmpC); blendPose(act, act, tmpC, smooth(q * 1.4)); }
+          return { w: 1 - smooth((q - 0.85) / 0.15), ground: true };
+        }
+        // the set position and the power step before take-off
+        if (ua < 0) { idlePose(act, t, a); KEEPER_SET(act); return { w: smooth((u + 0.15) / 0.15), ground: true }; }
+        const fly = smooth(ua / 0.3);                            // body rolling onto its side
+        const lie = c.land != null ? smooth((t - c.land) / 0.25) : 0;
+        diveFrame(act, t, a, side, hi, fly, lie, z);
+        const end = c.upAt == null ? 1 : 1;
+        return { w: smooth((ua + 0.12) / 0.12) * end, ground: true };
       }
       case S.SET: {
         idlePose(act, t, a); KEEPER_SET(act);
@@ -476,12 +519,18 @@ export function createController(lib, body) {
         return { w: envelope(0.15, 0.3), upper: true };
       }
       case S.WALLJUMP: {
-        // jump straight up on the spot, hands protecting
-        const clip = C.jump; if (!clip) return null;
-        const rate = 1.5, ap = c.t0 + 0.3;
-        sampleAction(clip, clamp(clip.ref + (t - ap) * rate, 0, clip.dur - 0.01), act);
+        // dip, spring straight up on the spot (height from the engine), land and absorb it
+        idlePose(act, t, a);
+        const tk = c.takeoff ?? c.t0 + 0.12, ld = c.land ?? tk + 0.5;
+        const dip = t < tk ? smooth((t - (tk - 0.2)) / 0.2) : t > ld ? 1 - smooth((t - ld) / 0.3) : 0;
+        const tuck = t >= tk && t <= ld ? Math.sin(clamp((t - tk) / Math.max(0.1, ld - tk), 0, 1) * Math.PI) : 0;
+        if (dip > 0) crouch(act, 0.14 * dip, 0.02, 0.12 * dip);
+        if (tuck > 0) {
+          rotateBone(act, I.LeftUpLeg, 1, 0, 0, -0.25 * tuck); rotateBone(act, I.RightUpLeg, 1, 0, 0, -0.25 * tuck);
+          rotateBone(act, I.LeftLeg, 1, 0, 0, 0.45 * tuck); rotateBone(act, I.RightLeg, 1, 0, 0, 0.45 * tuck);
+        }
         arms(act, [0.15, -0.9, 0.35], [-0.6, -0.35, 0.72], [-0.15, -0.9, 0.35], [0.6, -0.35, 0.72]);
-        return { w: smooth((t - (ap - clip.ref / rate)) / 0.15) * smooth((c.t1 + 0.3 - t) / 0.3) };
+        return { w: envelope(0.25, 0.3) };
       }
       case S.CALL: {
         // arm up, asking for it
@@ -522,6 +571,7 @@ export function createController(lib, body) {
 
   function agentPose(clip, a, t, look, ball) {
     const prep = prepare(clip);
+    curClip = clip;
     const N = clip.N, A = N_AGENTS;
     const f = clamp(t * HZ, 0, N - 1), i = Math.floor(f), j = Math.min(i + 1, N - 1), u = f - i;
     const Pp = clip.pos;
@@ -571,28 +621,48 @@ export function createController(lib, body) {
         arms(base, [0.85, -0.45, 0.25], [0.7, -0.2, 0.55], [-0.85, -0.45, 0.25], [-0.7, -0.2, 0.55], wj * 0.8);
       }
     }
-    // Touches on the ball: the foot flicks out to meet it
+    // Keeper: on his toes, knees bent, hands ready as the ball comes into range
+    if (look?.gloves && ball) {
+      const db = Math.hypot(ball.x - x, ball.y - y);
+      const r = smooth((30 - db) / 16) * (1 - smooth((sp - 2.5) / 1.5));
+      if (r > 0.01) {
+        // and a little bounce on the toes, so he's never flat-footed
+        const bob = Math.sin(t * 7.5 + a) * 0.012 * r;
+        crouch(base, 0.12 * r + bob, 0.07 * r, 0.24 * r);
+        arms(base, [0.55, -0.55, 0.6], [0.3, -0.1, 0.95], [-0.55, -0.55, 0.6], [-0.3, -0.1, 0.95], r * 0.85);
+      }
+    }
+    // Touches on the ball: the foot that played it goes to the ball (leg IK), and follows through
     const tl = prep.touches[a];
-    if (tl) {
+    if (tl && ball) {
       for (let k = 0; k < tl.length; k++) {
-        const dtt = t - tl[k].t;
-        if (dtt < -0.2 || dtt > 0.25) continue;
-        const g = Math.exp(-Math.pow((dtt + 0.02) / 0.09, 2));
-        const leg = I[(look?.foot === 'left' ? 'Left' : 'Right') + 'UpLeg'], knee = I[(look?.foot === 'left' ? 'Left' : 'Right') + 'Leg'];
-        rotateBone(base, leg, 1, 0, 0, -0.42 * g * (tl[k].kind === 'control' ? 0.8 : 1));
-        rotateBone(base, knee, 1, 0, 0, 0.2 * g);
+        const tc = tl[k], dtt = t - tc.t;
+        const drag = tc.kind === 'drag' || tc.kind === 'shield' || tc.kind === 'check';
+        if (dtt < -0.16 || dtt > (drag ? 0.32 : 0.16) || tc.kind === 'tackle' || tc.kind === 'chest') continue;
+        const g = drag ? smooth((dtt + 0.16) / 0.14) * (1 - smooth((dtt - 0.18) / 0.14)) : Math.exp(-Math.pow(dtt / 0.075, 2));
+        if (g < 0.02) continue;
+        const side = tc.foot === 'L' ? 'Left' : tc.foot === 'R' ? 'Right' : (look?.foot === 'left' ? 'Left' : 'Right');
+        // ball in character space (x: his left, z: forward)
+        const th = Math.PI / 2 - hd, cs = Math.cos(th), sn = Math.sin(th);
+        const ex = ball.x - x, ey = ball.y - y;
+        const lx = ex * cs - ey * sn, lz = ex * sn + ey * cs;
+        if (Math.hypot(lx, lz) > 1.3) continue;
+        // instep behind the ball; sole on top of it for stops, drags and checks
+        const ty = drag ? 0.2 : 0.09, tz = drag ? lz - 0.02 : lz - 0.15, tx = lx + (drag ? 0 : side === 'Left' ? 0.05 : -0.05);
+        legIK(base, side, tx, ty, tz, g * (tc.kind === 'control' ? 0.85 : 1));
       }
     }
     copyPose(pose, base);
 
     // Actions
-    let dx = 0, dy = 0, headLook = 1;
+    let dx = 0, dy = 0, headLook = 1, groundAct = false;
     prep.N1 = N - 1;
     for (const c of prep.inst[a]) {
       if (t < c.t0 - 1.3 || t > c.t1 + 1.3) continue;
       c.N1 = N - 1;
       const ac = actionPose(c, t, look, ball, a);
       if (!ac || ac.w <= 0) continue;
+      if (ac.ground) groundAct = true;
       if (ac.upper) { blendMaskedInto(pose, act, ac.w, UPPER); headLook *= 1 - ac.w * 0.5; }
       else { blendPose(pose, pose, act, ac.w); headLook *= 1 - ac.w; }
       // Contact: move the player so the boot / forehead meets the ball where the engine has it.
@@ -613,14 +683,18 @@ export function createController(lib, body) {
       }
     }
 
-    // Head and chest follow the ball (less while busy).
+    // Head and chest follow where the engine says he's looking — the ball, or a check over his
+    // shoulder, or the pass he's about to play (less while busy).
     if (ball && headLook > 0.02) {
-      const want = Math.atan2(ball.y - y, ball.x - x);
+      let want = Math.atan2(ball.y - y, ball.x - x);
+      if (clip.lk) { const l0 = clip.lk[i * A + a], l1 = clip.lk[j * A + a]; want = l0 + angDiff(l0, l1) * u; }
       const d = clamp(angDiff(hd, want), -1.4, 1.4) * (sp > 5 ? 0.35 : 1) * headLook;
       rotateBone(pose, I.Spine1, 0, 1, 0, -d * 0.25);
       rotateBone(pose, I.Neck, 0, 1, 0, -d * 0.3);
       rotateBone(pose, I.Head, 0, 1, 0, -d * 0.35);
     }
+    // Engine hip height: jumps go up (dives set their own hips)
+    if (clip.z && !groundAct) { const z = zOf(clip, a, t); if (z > 0.003) pose.r[1] += z; }
     out.yaw = hd;
     out.x = x + dx; out.y = y + dy;
     return out;

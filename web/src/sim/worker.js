@@ -9,7 +9,7 @@ self.onmessage = ({ data }) => {
   const { id, half, ev, ctx } = data;
   try {
     const clip = C.buildMoment(C.withHalf(M0, half), ev, { ...ctx, sent: new Set(ctx.sent || []) });
-    const bufs = [clip.pos, clip.st, clip.stT, clip.run, clip.ball, clip.cam, clip.poss, clip.offX].map(a => a.buffer);
+    const bufs = [clip.pos, clip.st, clip.stT, clip.hd, clip.ph, clip.z, clip.lk, clip.ball, clip.cam, clip.poss, clip.offX].filter(Boolean).map(a => a.buffer);
     self.postMessage({ id, clip }, bufs);
   } catch (e) {
     self.postMessage({ id, error: String(e?.stack || e) });

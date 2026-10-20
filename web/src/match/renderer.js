@@ -152,13 +152,13 @@ export function createMatch({ teams }) {
     M0 = C.makeMatch(TEAMS, meta?.styles || null);
     built = { n: 0, scenes: [], tl: [], moments: [], state: initState(), gen: (built.gen || 0) + 1 };
     complete = false; stats = null; ratings = null; analysis = { A: null, B: null };
-    // Pre-match: walk-out, line-ups, coin toss
+    // Pre-match: title over the stadium, then the two line-ups (the coin toss isn't a highlight).
     const walk = C.buildMoment(C.withHalf(M0, 1), {}, { kind: 'walkout', seed: 11, sent: new Set() });
-    push({ kind: 'intro', dur: 7000, clip: walk });
-    push({ kind: 'lineup', side: 'A', dur: 6500, clip: walk });
-    push({ kind: 'lineup', side: 'B', dur: 6500, clip: walk });
-    built.tl.push({ start: 0, end: 7000, kind: 'intro', type: 'intro', itemIndex: -1, side: null, minute: '' });
-    built.tl.push({ start: 7000, end: 20000, kind: 'lineups', type: 'lineups', itemIndex: -1, side: null, minute: '' });
+    const i0 = push({ kind: 'intro', dur: EDIT.intro, clip: walk });
+    push({ kind: 'lineup', side: 'A', dur: EDIT.lineup, clip: walk });
+    const l1 = push({ kind: 'lineup', side: 'B', dur: EDIT.lineup, clip: walk });
+    built.tl.push({ start: 0, end: i0.dur, kind: 'intro', type: 'intro', itemIndex: -1, side: null, minute: '' });
+    built.tl.push({ start: i0.dur, end: l1.start + l1.dur, kind: 'lineups', type: 'lineups', itemIndex: -1, side: null, minute: '' });
   }
   async function ensureKickoff() {
     const st = built.state;
@@ -166,8 +166,7 @@ export function createMatch({ teams }) {
     st.kickedOff = true;
     const ko = meta?.kickoff === 'B' ? 'B' : 'A';
     st.firstKick = ko;
-    push({ kind: 'toss', dur: 2600, side: ko });
-    await clipScene({ type: 'kickoff', side: ko, min: 1, add: 0, text: `${TEAMS[ko].name} get us under way.` }, -1, 'kickoff', { live: true });
+    await clipScene({ type: 'kickoff', side: ko, min: 1, add: 0, text: `${TEAMS[ko].name} get us under way.` }, -1, 'kickoff', {});
   }
 
   async function addItem(it, idx) {
@@ -203,30 +202,142 @@ export function createMatch({ teams }) {
       }
       if (ev.card === 'yellow') st.ev.yellow[si ? 0 : 1]++;
       if (ev.card === 'red' || ev.card === 'second_yellow') st.ev.red[si ? 0 : 1]++;
+      // Only bookings, red cards and penalties are highlights. A foul in the final third is still
+      // simulated (hidden) because the free kick that may follow is set up from where it happened.
       const { u } = { u: (Number(ev.x) || 50) * 1.05 };
-      render = !!ev.card || ev.penalty || u >= 66;
-      kind = 'foul';
+      render = !!ev.card || !!ev.penalty;
+      kind = render || u >= 66 ? 'foul' : null;
     } else if (ev.type === 'offside') { st.ev.offsides[si]++; render = true; kind = 'offside'; }
-    else if (ev.type === 'corner') { st.ev.corners[si]++; render = (min - st.lastRendered) >= 4; kind = 'corner'; }
+    else if (ev.type === 'corner') { st.ev.corners[si]++; }   // a cleared corner isn't a highlight
     else if (ev.type === 'injury') { render = true; kind = 'injury'; }
     else if (ev.type === 'var') { render = true; kind = 'var'; }
 
     if (!render) {
       built.tl.push({ start: st.t, end: st.t, kind: 'ev', type: ev.type, itemIndex: idx, side: ev.side || null, minute: minuteStr(min, add) });
+      if (kind === 'foul') await clipScene(ev, idx, 'foul', { hidden: true });
       st.lastMin = min;
       return;
-    }
-    // A spell of play between big moments.
-    if (min - st.lastRendered >= 9 && kind !== 'var') {
-      const f = st.lastFlow;
-      await clipScene({ type: 'flow', side: f?.momentum === 'B' ? 'B' : f?.momentum === 'A' ? 'A' : (min % 2 ? 'A' : 'B'), min: Math.max(st.lastRendered + 3, min - 4), add: 0, text: f?.note || '' }, -1, 'flow', { live: true, short: true });
     }
     if (kind === 'var') varScene(ev, idx, min, add);
     else await clipScene(ev, idx, kind, {});
     st.lastMin = min; st.lastRendered = min;
   }
 
-  // One scripted moment → live clip (+ replay + analysis freeze for big moments).
+  // ---------------------------------------------------------------- the edit
+  // Durations (ms) of the graphics scenes, and the rules that turn each simulated clip into a story
+  // beat: join the move shortly before the decisive action, leave right after the payoff and a short
+  // reaction (never through restarts, walking back or set-ups). All decisions are made from the
+  // clip's own marks when the event arrives, so the edit is deterministic and streaming-safe.
+  const EDIT = { intro: 5000, lineup: 4400, ht: 6000, ft: 6000, motm: 4600, ratings: 6000, analysis: 6500, end: 3600, freeze: 3000, freezeLine: 3400 };
+  const SAVED = ['saved', 'parried', 'tipped'];
+  const RESTART_CAP = new Set(['freekick', 'goalkick', 'corner']);
+  // In-point: the earliest pass of the move inside [key − maxLead, key − minLead] (a beat before it),
+  // so the clip opens on the move that leads to the moment rather than on aimless possession.
+  function moveStart(clip, key, minLead, maxLead, fallback) {
+    const ps = clip.marks.passes.filter(p => p.t0 < key - 0.3 && p.t0 >= key - maxLead + 0.6);
+    const t = ps.length ? ps[0].t0 - 0.6 : key - fallback;
+    return clamp(t, key - maxLead, key - minLead);
+  }
+  function cutPoints(clip, ev, kind) {
+    const m = clip.marks, climax = clip.info.climax || 0;
+    let key = climax, inT, outT;
+    const capAt = icon => m.captions.find(c => c.icon === icon)?.t;
+    if (kind === 'shot') {
+      key = m.shot?.t ?? climax;
+      const setPiece = ev.technique === 'penalty' || ev.assist_type === 'penalty' || ev.technique === 'free_kick' || ev.assist_type === 'free_kick';
+      const wh = m.whistles.filter(t => t < key).pop();
+      if (setPiece && wh != null) inT = wh - 1.0;                    // the referee's whistle, the run-up
+      else if (ev.assist_type === 'corner') { const cr = m.passes.filter(p => p.t0 < key).pop(); inT = cr ? cr.t0 - 1.4 : key - 4; }
+      else {
+        // goals and big chances get the whole move; a half-chance just the last pass and the effort
+        const major = ev.outcome === 'goal' || ev.outcome === 'disallowed' || ev.outcome === 'woodwork' || Number(ev.xg) >= 0.25;
+        inT = major ? moveStart(clip, key, 4.5, 7.5, 6) : moveStart(clip, key, 3, 4.6, 4);
+      }
+      const flight = key + (m.shot?.dur || 0.8);
+      if (ev.outcome === 'goal') outT = (m.goalT ?? flight) + 5.0;   // GOAL graphic + celebration close-up
+      else if (ev.outcome === 'disallowed') outT = (m.disallowed?.t ?? (m.goalT ?? flight) + 1.2) + 2.0;
+      else if (SAVED.includes(ev.outcome)) outT = (m.saveT ?? flight) + 1.7;
+      else if (ev.outcome === 'woodwork') outT = (m.postT ?? flight) + 1.8;
+      else if (ev.outcome === 'blocked') outT = key + 2.2;
+      else outT = flight + 1.6;                                        // off target: the reaction
+    } else if (kind === 'foul') {
+      key = m.foul?.t ?? climax;
+      inT = moveStart(clip, key, 2.6, 4.2, 3.4);
+      outT = m.card ? m.card.t + 2.6 : key + (ev.penalty ? 2.8 : 2.2);
+    } else if (kind === 'offside') {
+      key = m.offside?.t ?? climax;
+      inT = moveStart(clip, key, 3, 5, 4);
+      outT = Math.max(key + 2.4, (capAt('offside') ?? key) + 1.6);
+    } else if (kind === 'kickoff') { inT = climax - 0.7; outT = climax + 2.5; }
+    else if (kind === 'whistle') { inT = climax - 1.6; outT = climax + (ev.type === 'full_time' ? 4.2 : 3.2); }
+    else { inT = climax - 3; outT = climax + 3; }
+    // never into the restart that follows (goal kick, corner, free-kick set-up) — a short reaction at most
+    const rs = m.captions.find(c => RESTART_CAP.has(c.icon) && c.t > key + 0.3);
+    if (rs && kind !== 'kickoff' && kind !== 'whistle') outT = Math.min(outT, Math.max(rs.t + 0.2, m.card ? m.card.t + 1.8 : key + 1.6));
+    inT = clamp(inT, 0, Math.max(0, key - 0.5));
+    outT = clamp(outT, Math.min(clip.dur, key + 0.8), clip.dur);
+    return { inT, outT, key };
+  }
+
+  // Replays: the decisive 2–4 s, speed-ramped — close to real speed into the action, slow (≈0.4–0.5×)
+  // only around the strike / save / contact, then back up. Goals get a second angle.
+  function replayAngles(clip, ev, kind, isGoal) {
+    const m = clip.marks, climax = clip.info.climax || 0;
+    if (kind === 'shot' && m.shot) {
+      const ts = m.shot.t, end = m.goalT ?? m.saveT ?? m.postT ?? ts + (m.shot.dur || 0.8);
+      if (ev.outcome === 'disallowed' && m.offside) {
+        const tp = m.offside.t;
+        return [{ cam: 'line', from: tp - 1.5, to: tp + 1.3, base: 0.95, slow: [{ a: tp - 0.2, b: tp + 0.25, s: 0.35 }] }];
+      }
+      const last = m.passes.filter(p => p.t0 < ts - 0.2).pop();
+      const from = clamp(last ? last.t0 - 0.3 : ts - 1.7, ts - 2.0, ts - 1.2);
+      // goals: behind the goal, slow on the strike, real speed into the net; then over the shooter's
+      // shoulder, slow on the strike again. Saves / woodwork: slow from the strike to the save.
+      if (isGoal) return [
+        { cam: 'goal', from, to: end + 0.55, base: 1, slow: [{ a: ts - 0.12, b: ts + 0.3, s: 0.45 }] },
+        { cam: 'strike', from: ts - 0.6, to: end + 0.35, base: 0.9, slow: [{ a: ts - 0.12, b: ts + 0.2, s: 0.4 }] },
+      ];
+      return [{ cam: 'goal', from: Math.max(from, ts - 1.6), to: end + 0.7, base: 1, slow: [{ a: ts - 0.12, b: Math.min(end + 0.2, ts + 1.2), s: 0.5 }] }];
+    }
+    if (kind === 'foul') {
+      const tf = m.foul?.t ?? climax;
+      return [{ cam: 'reverse', from: tf - 1.4, to: tf + 0.8, base: 1, slow: [{ a: tf - 0.25, b: tf + 0.25, s: 0.4 }] }];
+    }
+    if (kind === 'offside') {
+      const tp = m.offside?.t ?? climax;
+      return [{ cam: 'line', from: tp - 1.5, to: tp + 1.3, base: 0.95, slow: [{ a: tp - 0.2, b: tp + 0.25, s: 0.35 }] }];
+    }
+    return [{ cam: 'reverse', from: climax - 1.5, to: climax + 1, base: 0.9, slow: [{ a: climax - 0.2, b: climax + 0.3, s: 0.45 }] }];
+  }
+  // Time map for a ramped replay: tab[k] = replay-local seconds at clip time from + k·RSTEP.
+  const RSTEP = 1 / 120;
+  function rampTable(clip, ang) {
+    const from = clamp(ang.from, 0, clip.dur - 0.2), to = clamp(ang.to, from + 0.2, clip.dur - 0.01);
+    const speed = ct => {
+      let w = 0, s = ang.base;
+      for (const z of ang.slow) {
+        const r = 0.28;
+        const ww = ct < z.a - r ? 0 : ct < z.a ? smooth((ct - (z.a - r)) / r) : ct <= z.b ? 1 : ct < z.b + r ? 1 - smooth((ct - z.b) / r) : 0;
+        if (ww > w) { w = ww; s = z.s; }
+      }
+      return lerp(ang.base, s, w);
+    };
+    const n = Math.max(2, Math.ceil((to - from) / RSTEP) + 1);
+    const tab = new Float64Array(n);
+    for (let k = 1; k < n; k++) tab[k] = tab[k - 1] + RSTEP / speed(from + (k - 0.5) * RSTEP);
+    return { from, to: from + (n - 1) * RSTEP, tab };
+  }
+  function rampCt(sc, local) {
+    const tab = sc.tab, s = local / 1000;
+    let lo = 0, hi = tab.length - 1;
+    if (s >= tab[hi]) return sc.from + hi * RSTEP;
+    while (lo < hi) { const mid = (lo + hi + 1) >> 1; if (tab[mid] <= s) lo = mid; else hi = mid - 1; }
+    const a = (s - tab[lo]) / (tab[lo + 1] - tab[lo] || 1);
+    return sc.from + (lo + clamp(a, 0, 1)) * RSTEP;
+  }
+  const rampLocal = (sc, ct) => { const k = clamp((ct - sc.from) / RSTEP, 0, sc.tab.length - 1), i = Math.floor(k), j = Math.min(i + 1, sc.tab.length - 1); return lerp(sc.tab[i], sc.tab[j], k - i) * 1000; };
+
+  // One scripted moment → live clip (+ ramped replay, + analysis freeze for goals and offsides).
   async function clipScene(ev, idx, kind, opt) {
     const st = built.state;
     const half = (Number(ev.min) || 1) >= 46 || st.half === 2 ? 2 : 1;
@@ -235,19 +346,16 @@ export function createMatch({ teams }) {
     const ctx = { kind, seed, sent: new Set(st.sent), setup: (ev.type === 'shot' && (ev.assist_type === 'free_kick' || ev.technique === 'free_kick' || ev.technique === 'penalty' || ev.assist_type === 'penalty')) ? st.setup : null };
     let clip;
     try { clip = await build(half, ev, ctx); } catch (e) { console.warn('clip failed', e); return; }
+    if (opt.hidden) { if (clip.marks.setup) st.setup = clip.marks.setup; return; }
     const min = Number(ev.min) || 1, add = Number(ev.add) || 0;
-    const scoreBefore = [...st.score];
     const isGoal = kind === 'shot' && ev.outcome === 'goal';
     const scorerSide = ev.side;
+    const sc = pushClip(clip, ev, idx, kind, M, half, min, add);
     const climax = clip.info.climax || 0;
-    // Highlights join the move a few seconds before the key moment.
-    const lead = kind === 'shot' ? (isGoal ? 9.5 : 8) : kind === 'foul' ? 6.5 : kind === 'offside' ? 6.5 : 30;
-    const trim = opt.short ? Math.max(0, Math.min(clip.dur - 8, 2)) : Math.max(0, climax - lead);
-    const sc = push({ kind: 'clip', clip, ev, idx, M, half, trimStart: trim, dur: Math.round((clip.dur - trim) * 1000), min, add, scoreBefore, climax, isGoal, isWipe: !opt.short, live: true });
-    if (idx >= 0) built.tl.push({ start: sc.start + Math.max(0, (climax - trim) * 1000 - 300), end: sc.start + sc.dur, kind: 'ev', type: ev.type === 'shot' ? (ev.outcome === 'goal' ? (ev.ownGoal ? 'own_goal' : ev.technique === 'penalty' ? 'penalty_goal' : 'goal') : ev.outcome === 'woodwork' ? 'woodwork' : ev.outcome === 'blocked' ? 'block' : ['saved', 'parried', 'tipped'].includes(ev.outcome) ? 'save' : ev.outcome === 'disallowed' ? 'var' : 'shot') : ev.type === 'foul' ? (ev.card ? (ev.card === 'yellow' ? 'yellow' : 'red') : ev.penalty ? 'penalty' : 'foul') : ev.type, itemIndex: idx, side: ev.side || null, minute: minuteStr(min, add) });
+    if (idx >= 0) built.tl.push({ start: sc.start + Math.max(0, clipLocal(sc, climax) - 300), end: sc.start + sc.dur, kind: 'ev', type: ev.type === 'shot' ? (ev.outcome === 'goal' ? (ev.ownGoal ? 'own_goal' : ev.technique === 'penalty' ? 'penalty_goal' : 'goal') : ev.outcome === 'woodwork' ? 'woodwork' : ev.outcome === 'blocked' ? 'block' : ['saved', 'parried', 'tipped'].includes(ev.outcome) ? 'save' : ev.outcome === 'disallowed' ? 'var' : 'shot') : ev.type === 'foul' ? (ev.card ? (ev.card === 'yellow' ? 'yellow' : 'red') : ev.penalty ? 'penalty' : 'foul') : ev.type, itemIndex: idx, side: ev.side || null, minute: minuteStr(min, add) });
     if (isGoal) {
       st.score[scorerSide === 'B' ? 1 : 0]++;
-      sc.goalAt = sc.start + Math.round(((clip.marks.goalT || climax) - trim) * 1000);
+      sc.goalAt = sc.start + Math.round(clipLocal(sc, clip.marks.goalT || climax));
       st.goals.push({ side: scorerSide, name: ev.ownGoal ? `${ev.og} (OG)` : ev.player, min: minuteStr(min, add), pen: ev.technique === 'penalty' });
     }
     if (kind === 'foul') {
@@ -255,22 +363,31 @@ export function createMatch({ teams }) {
       if (ev.card === 'red' || ev.card === 'second_yellow') { const a = clip.info.offender; if (a != null) st.sent.add(a); }
       if (ev.card) st.cards.push({ side: ev.side === 'A' ? 'B' : 'A', name: ev.offender, color: ev.card === 'yellow' ? 'yellow' : 'red', min: minuteStr(min, add) });
     } else st.setup = null;
-    const big = isGoal || (kind === 'shot' && (['woodwork', 'disallowed'].includes(ev.outcome) || (['saved', 'parried', 'tipped'].includes(ev.outcome) && (Number(ev.xg) >= 0.25 || ev.technique === 'penalty')))) || (kind === 'foul' && (ev.card === 'red' || ev.card === 'second_yellow' || ev.penalty)) || kind === 'offside';
-    if (big && !opt.live) {
-      const replayCam = kind === 'shot' ? 'goal' : 'reverse';
-      const from = Math.max(0, climax - (isGoal ? 3.6 : 2.6)), to = Math.min(clip.dur - 0.1, climax + (isGoal ? 1.7 : 1.4));
-      const slow = 0.5;
-      push({ kind: 'replay', clip, ev, M, half, from, to, slow, cam: replayCam, dur: Math.round(((to - from) / slow) * 1000), min, add, scoreBefore: [...st.score] });
-      const fr = push({ kind: 'freeze', clip, ev, M, half, at: freezeAt(clip, kind, ev), dur: 5200, min, add, scoreBefore: [...st.score], idx });
-      built.moments.push({ t: fr.start + 1600, title: momentTitle(ev, kind), minute: minuteStr(min, add), side: ev.side, type: built.tl[built.tl.length - 1]?.type || kind });
+    const big = isGoal || (kind === 'shot' && (['woodwork', 'disallowed'].includes(ev.outcome) || (SAVED.includes(ev.outcome) && (Number(ev.xg) >= 0.25 || ev.technique === 'penalty')))) || (kind === 'foul' && (ev.card === 'red' || ev.card === 'second_yellow' || ev.penalty)) || kind === 'offside';
+    if (!big) return;
+    const type = built.tl[built.tl.length - 1]?.type || kind;
+    let momentT = null;
+    replayAngles(clip, ev, kind, isGoal).forEach((ang, i) => {
+      const r = rampTable(clip, ang);
+      const rp = push({ kind: 'replay', clip, ev, M, half, from: r.from, to: r.to, tab: r.tab, cam: ang.cam, angle: i, dur: Math.round(r.tab[r.tab.length - 1] * 1000), min, add, scoreBefore: [...st.score] });
+      if (i === 0) momentT = rp.start + Math.round(rampLocal(rp, freezeAt(clip, kind, ev)));
+    });
+    // Analysis image ("how it happened") only where a still explains something: how a goal was
+    // made, and where the offside line was.
+    const lineCall = kind === 'offside' || ev.outcome === 'disallowed';
+    if (isGoal || lineCall) {
+      const fr = push({ kind: 'freeze', clip, ev, M, half, at: freezeAt(clip, kind, ev), dur: lineCall ? EDIT.freezeLine : EDIT.freeze, min, add, scoreBefore: [...st.score], idx });
+      momentT = fr.start + 1100;
     }
-    if (isGoal) {
-      // Restart: kick-off by the team that conceded.
-      const conceding = scorerSide === 'A' ? 'B' : 'A';
-      const ko = await build(half, { side: conceding }, { kind: 'kickoff', seed: seed ^ 0x9e37, sent: new Set(st.sent) });
-      push({ kind: 'clip', clip: ko, ev: { type: 'kickoff', side: conceding, min, add, text: '' }, idx: -1, M, half, dur: 3600, min, add, scoreBefore: [...st.score], climax: 1, trimStart: 0.3, isWipe: false });
-    }
+    built.moments.push({ t: momentT, title: momentTitle(ev, kind), minute: minuteStr(min, add), side: ev.side, type });
   }
+  // A live clip trimmed to its story beat: [inT, outT] of the simulated clip.
+  function pushClip(clip, ev, idx, kind, M, half, min, add, extra = {}) {
+    const st = built.state;
+    const cut = cutPoints(clip, ev, kind);
+    return push({ kind: 'clip', clip, ev, idx, M, half, trimStart: cut.inT, outT: cut.outT, key: cut.key, dur: Math.round((cut.outT - cut.inT) * 1000), min, add, scoreBefore: [...st.score], climax: clip.info.climax || 0, isGoal: kind === 'shot' && ev.outcome === 'goal', live: true, ...extra });
+  }
+  const clipLocal = (sc, ct) => (ct - (sc.trimStart || 0)) * 1000;
   function freezeAt(clip, kind, ev) {
     if (kind === 'offside') return clip.marks.offside?.t ?? clip.info.climax;
     if (kind === 'foul') return (clip.marks.foul?.t ?? clip.info.climax) + 0.05;
@@ -309,16 +426,14 @@ export function createMatch({ teams }) {
     st.htDone = true;
     const M = C.withHalf(M0, 1);
     const wh = await build(1, { type: 'half_time', text: ev.text }, { kind: 'whistle', seed: 77, sent: new Set(st.sent) });
-    const wtr = Math.max(0, (wh.info.climax || 1.6) - 2.6);
-    const sc = push({ kind: 'clip', clip: wh, ev: { ...ev, type: 'half_time' }, idx, M, half: 1, trimStart: wtr, dur: Math.round((wh.dur - wtr) * 1000), min: 45, add: add || 0, scoreBefore: [...st.score], climax: wh.info.climax || 1.6, isWipe: true });
-    if (idx >= 0) built.tl.push({ start: sc.start + 2400, end: sc.start + sc.dur, kind: 'ev', type: 'half_time', itemIndex: idx, side: null, minute: minuteStr(45, add) });
-    push({ kind: 'ht', dur: 8000, score: [...st.score], stats: JSON.parse(JSON.stringify(st.ev)), goals: [...st.goals], cards: [...st.cards] });
-    push({ kind: 'switch', dur: 3200 });
+    const sc = pushClip(wh, { ...ev, type: 'half_time' }, idx, 'whistle', M, 1, 45, add || 0);
+    if (idx >= 0) built.tl.push({ start: sc.start + Math.round(clipLocal(sc, wh.info.climax || 0)), end: sc.start + sc.dur, kind: 'ev', type: 'half_time', itemIndex: idx, side: null, minute: minuteStr(45, add) });
+    push({ kind: 'ht', dur: EDIT.ht, score: [...st.score], stats: JSON.parse(JSON.stringify(st.ev)), goals: [...st.goals], cards: [...st.cards] });
     st.half = 2; st.setup = null; st.lastRendered = 46;
     const ko = st.firstKick === 'A' ? 'B' : 'A';
     const M2 = C.withHalf(M0, 2);
     const k = await build(2, { side: ko }, { kind: 'kickoff', seed: 99, sent: new Set(st.sent) });
-    push({ kind: 'clip', clip: k, ev: { type: 'second_half', side: ko, min: 46, add: 0, text: `Second half under way — ${TEAMS[ko].name} kick off.` }, idx: -1, M: M2, half: 2, dur: Math.round(k.dur * 1000), min: 46, add: 0, scoreBefore: [...st.score], climax: 1, isWipe: false });
+    pushClip(k, { type: 'second_half', side: ko, min: 46, add: 0, text: `Second half under way — ${TEAMS[ko].name} kick off.` }, -1, 'kickoff', M2, 2, 46, 0);
   }
   async function fullTime(ev, idx, min, add) {
     const st = built.state;
@@ -329,20 +444,21 @@ export function createMatch({ teams }) {
     const winner = st.score[0] > st.score[1] ? 'A' : st.score[1] > st.score[0] ? 'B' : null;
     st.ftStart = 'building';
     const wh = await build(2, { type: 'full_time', winner, text: ev.text }, { kind: 'whistle', seed: 88, sent: new Set(st.sent) });
-    const wtr = Math.max(0, (wh.info.climax || 1.6) - 2.6);
-    const sc = push({ kind: 'clip', clip: wh, ev: { ...ev, type: 'full_time' }, idx, M, half: 2, trimStart: wtr, dur: Math.round((wh.dur - wtr) * 1000), min: 90, add: add || 0, scoreBefore: [...st.score], climax: wh.info.climax || 1.6, isWipe: true });
-    st.ftWhistle = sc.start + 2600;
-    if (idx >= 0) built.tl.push({ start: sc.start + 2600, end: sc.start + sc.dur, kind: 'ev', type: 'full_time', itemIndex: idx, side: null, minute: minuteStr(90, add) });
+    const sc = pushClip(wh, { ...ev, type: 'full_time' }, idx, 'whistle', M, 2, 90, add || 0);
+    st.ftWhistle = sc.start + Math.round(clipLocal(sc, wh.info.climax || 0));
+    if (idx >= 0) built.tl.push({ start: st.ftWhistle, end: sc.start + sc.dur, kind: 'ev', type: 'full_time', itemIndex: idx, side: null, minute: minuteStr(90, add) });
     st.ftStart = 'pending';
     maybeFT();
   }
   function maybeFT(force) {
     const st = built.state;
     if (st.ftStart !== 'pending' || (!stats && !force)) return;
-    const sc = push({ kind: 'ft', dur: 9000, score: [...st.score], goals: [...st.goals], cards: [...st.cards], ev: JSON.parse(JSON.stringify(st.ev)) });
+    const sc = push({ kind: 'ft', dur: EDIT.ft, score: [...st.score], goals: [...st.goals], cards: [...st.cards], ev: JSON.parse(JSON.stringify(st.ev)) });
     st.ftStart = sc.start;
     built.tl.push({ start: sc.start, end: sc.start + sc.dur, kind: 'fulltime', type: 'fulltime', itemIndex: -1, side: null, minute: 'FT' });
   }
+  // After the final whistle: player of the match, ratings, one card per team, the final score.
+  // (No recap montage: the viewer has just watched those moments.)
   async function buildOutro() {
     const st = built.state;
     if (st.outro) return;
@@ -350,12 +466,11 @@ export function createMatch({ teams }) {
     if (st.ftStart === 'pending') maybeFT(true);
     st.outro = true;
     const s0 = st.t;
-    if (stats?.motm) push({ kind: 'motm', dur: 6500 });
-    if (ratings) push({ kind: 'ratings', dur: 7000 });
-    if (analysis.A) push({ kind: 'analysis', side: 'A', dur: 9500 });
-    if (analysis.B) push({ kind: 'analysis', side: 'B', dur: 9500 });
-    if (built.moments.length) push({ kind: 'montage', dur: 7000 });
-    push({ kind: 'end', dur: 4500 });
+    if (stats?.motm) push({ kind: 'motm', dur: EDIT.motm });
+    if (ratings) push({ kind: 'ratings', dur: EDIT.ratings });
+    if (analysis.A) push({ kind: 'analysis', side: 'A', dur: EDIT.analysis });
+    if (analysis.B) push({ kind: 'analysis', side: 'B', dur: EDIT.analysis });
+    push({ kind: 'end', dur: EDIT.end });
     built.tl.push({ start: s0, end: st.t, kind: 'outro', type: 'outro', itemIndex: -1, side: null, minute: 'FT' });
   }
 
@@ -453,8 +568,9 @@ export function createMatch({ teams }) {
         const d = 7.2;
         return D.camera([p.x + Math.sin(ang) * d, p.y + Math.cos(ang) * d, 2.4], [p.x, p.y, 1.2], 30);
       }
-      // Booking: close on the referee and the player.
-      if (m.card && ct > m.card.t - 0.3 && ct < m.card.t + 2.5) {
+      // Booking: close on the referee and the player (a second yellow: from the yellow card on).
+      // Held to the end of the clip so the edit never flicks back to the wide shot for a moment.
+      if (m.card && ct > m.card.t - (m.card.second ? 1.5 : 0.35) && ct < Math.max(m.card.t + 2.5, sc.outT ?? 0)) {
         const r = avgPos(c, C.REF, ct, 0.4), o = m.card.agent != null ? avgPos(c, m.card.agent, ct, 0.4) : r;
         const x = (r.x + o.x) / 2, y = (r.y + o.y) / 2;
         return D.camera([x + 6, y + 12, 4.4], [x, y, 1.1], 36);
@@ -462,7 +578,9 @@ export function createMatch({ teams }) {
       let cx = lerp(c.cam[i * 2], c.cam[j * 2], a), z = lerp(c.cam[i * 2 + 1], c.cam[j * 2 + 1], a);
       // Shot: push in towards the goal so the ball hitting the net is clearly visible.
       if (m.shot) {
-        const ts = m.shot.t, te = (m.goalT ?? (ts + m.shot.dur)) + 1.1;
+        // (held through the end of the clip if it ends soon after, rather than pulling out as it cuts)
+        let ts = m.shot.t, te = (m.goalT ?? (ts + m.shot.dur)) + 1.1;
+        if (sc.outT != null && m.goalT == null && sc.outT - te < 1.6) te = sc.outT;
         const w = ct < ts ? smooth(clamp((ct - (ts - 1.1)) / 0.9, 0, 1)) : ct > te ? 1 - smooth(clamp((ct - te) / 0.7, 0, 1)) : 1;
         if (w > 0) {
           // Frame the goal mouth itself (the push-in may go right to the end of the pitch).
@@ -487,10 +605,62 @@ export function createMatch({ teams }) {
       const fov = clamp((2 * Math.atan(10 / Math.max(dist, 1)) * 180) / Math.PI, 24, 56);
       return D.camera(pos, [lx, ly, 0.9], fov);
     }
-    if (mode === 'reverse') return D.reverseCam(bx, by);
+    if (mode === 'reverse') {
+      // reverse angle from the far side, panning with the (smoothed) ball
+      const p = ballAvg(c, ct, 0.35);
+      return D.reverseCam(p.x, p.y);
+    }
+    if (mode === 'strike') {
+      // over the shooter's shoulder: a fixed camera behind the strike that pans with the ball to goal
+      const pos = strikeCamPos(c);
+      const b = ballAvg(c, ct, 0.12), lk = [b.x, b.y, 0.9];
+      const dist = Math.hypot(pos[0] - b.x, pos[1] - b.y);
+      return D.camera(pos, lk, clamp((2 * Math.atan(7 / Math.max(dist, 1)) * 180) / Math.PI, 20, 50));
+    }
+    if (mode === 'line') {
+      // offside camera: square on the last defender's line at the moment of the pass
+      const off = c.marks.offside, tk = clamp(Math.round((off?.t ?? ct) * HZ), 0, c.N - 1);
+      let lx = bx;
+      if (off) { const defSide = off.sideAtt === 'A' ? 'B' : 'A'; lx = defSide === (sc.M.dir.A > 0 ? 'B' : 'A') ? c.offX[tk * 2 + 1] : c.offX[tk * 2]; }
+      const b = ballAvg(c, ct, 0.3);
+      // the main gantry position slid along to the line, a little tighter
+      return D.broadcastCam(lx + (b.x - lx) * 0.15, 1.3, lookY(c, ct));
+    }
     if (mode === 'close') return D.closeCam(bx, by, 1);
     const cx = lerp(c.cam[i * 2], c.cam[j * 2], a), z = lerp(c.cam[i * 2 + 1], c.cam[j * 2 + 1], a);
     return D.broadcastCam(cx, z, lookY(c, ct));
+  }
+  // Over-the-shoulder replay camera: behind the shooter on the line of the shot, on whichever side
+  // (and at whichever distance) nobody stands between the lens and the shooter at the strike.
+  const strikeMemo = new WeakMap();
+  function strikeCamPos(c) {
+    if (strikeMemo.has(c)) return strikeMemo.get(c);
+    const s = c.marks.shot, sp = posAt(c, s.agent, s.t) || s.from;
+    let dx = s.to.x - sp.x, dy = s.to.y - sp.y; const dl = Math.hypot(dx, dy) || 1; dx /= dl; dy /= dl;
+    const f = clamp(Math.round(s.t * HZ), 0, c.N - 1);
+    let best = null, bestS = Infinity;
+    for (const back of [6.5, 8.5, 5]) for (const lat of [-2.6, 2.6, -4.5, 4.5, 0.8]) {
+      const cx = sp.x - dx * back - dy * lat, cy = sp.y - dy * back + dx * lat;
+      let occ = 0;
+      for (let ag = 0; ag < 25; ag++) {
+        if (ag === s.agent) continue;
+        const ax = c.pos[(f * 25 + ag) * 2], ay = c.pos[(f * 25 + ag) * 2 + 1];
+        if (ax < -20) continue;
+        const sx = sp.x - cx, sy = sp.y - cy, l2 = sx * sx + sy * sy;
+        const u = clamp(((ax - cx) * sx + (ay - cy) * sy) / l2, 0, 1.05);
+        const dd = Math.hypot(cx + sx * u - ax, cy + sy * u - ay);
+        if (dd < 1.4) occ += (1.4 - dd) * (1.5 - u);
+      }
+      const score = occ * 5 + Math.abs(lat) * 0.15 + Math.abs(back - 6.5) * 0.1;
+      if (score < bestS) { bestS = score; best = [cx, cy, 2.3]; }
+    }
+    strikeMemo.set(c, best);
+    return best;
+  }
+  function ballAvg(c, ct, win) {
+    let x = 0, y = 0, n = 0;
+    for (let k = -4; k <= 4; k++) { const f2 = clamp(Math.round((ct + (k / 4) * win) * HZ), 0, c.N - 1); x += c.ball[f2 * 3]; y += c.ball[f2 * 3 + 1]; n++; }
+    return { x: x / n, y: y / n };
   }
   // The main camera tilts gently towards the ball's side of the pitch (smoothed over ~1.5 s).
   function lookY(c, ct) {
@@ -579,7 +749,8 @@ export function createMatch({ teams }) {
     return s;
   }
   function clockText(sc, ct) {
-    const base = (sc.min - 1) * 60 + 25;
+    const ko = sc.ev?.type === 'kickoff' || sc.ev?.type === 'second_half';
+    const base = (sc.min - 1) * 60 + (ko ? 0 : 25);
     let sec = Math.max(0, base + (ct - (sc.climax || 0)));
     if (sc.min >= 45 && sc.min < 46 || sc.min >= 90) sec = Math.min(sec, sc.min * 60 - 1 + (sc.add ? 59 : 0));
     const m = Math.floor(sec / 60), s = Math.floor(sec % 60);
@@ -621,28 +792,36 @@ export function createMatch({ teams }) {
   function lowerThird(ctx, sc, ct) {
     const caps = sc.clip.marks.captions;
     let cap = null;
-    for (const c of caps) if (ct >= c.t && ct < c.t + 3.4) cap = c;
+    // captions from before the clip's in-point aren't shown half-way through
+    for (const c of caps) if (ct >= c.t && ct < c.t + 3.4 && c.t >= (sc.trimStart || 0) - 0.2 && !(RESTART_CAP.has(c.icon) && c.t > (sc.key ?? Infinity))) cap = c;
     if (!cap || !cap.text) return null;
     const p = clamp((ct - cap.t) / 0.35, 0, 1), q = clamp((cap.t + 3.4 - ct) / 0.35, 0, 1);
-    const alpha = Math.min(p, q), slide = (1 - easeOut(p)) * 30;
+    drawLowerThird(ctx, sc.ev?.side, minuteStr(sc.min, sc.add), cap.text, cap.icon, Math.min(p, q), (1 - easeOut(p)) * 30);
+    return cap;
+  }
+  function drawLowerThird(ctx, side, label, text, icon, alpha, slide) {
     const w = 860, x = (W - w) / 2, y = H - 92 + slide;
     ctx.save(); ctx.globalAlpha = alpha;
     ctx.fillStyle = 'rgba(6,10,8,0.86)'; D.roundRect(ctx, x, y, w, 56, 10); ctx.fill();
-    const side = sc.ev?.side;
     ctx.fillStyle = side === 'B' ? TEAMS.B.color : side === 'A' ? TEAMS.A.color : '#16a34a';
     D.roundRect(ctx, x + 10, y + 10, 64, 36, 7); ctx.fill();
     ctx.fillStyle = lum(ctx.fillStyle) > 0.62 ? '#111' : '#fff';
     ctx.font = `900 16px ${FONT}`; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-    ctx.fillText(minuteStr(sc.min, sc.add), x + 42, y + 28.5);
-    if (cap.icon === 'yellow' || cap.icon === 'red') { ctx.fillStyle = cap.icon === 'red' ? '#ef1c1c' : '#ffd400'; ctx.fillRect(x + 88, y + 15, 17, 25); }
-    const tx = cap.icon === 'yellow' || cap.icon === 'red' ? x + 118 : x + 90;
-    const lines = wrap(cap.text, 650, fit(cap.text, 650, 19, w - (tx - x) - 20, 14), w - (tx - x) - 20, 2);
+    ctx.fillText(label, x + 42, y + 28.5);
+    if (icon === 'yellow' || icon === 'red') { ctx.fillStyle = icon === 'red' ? '#ef1c1c' : '#ffd400'; ctx.fillRect(x + 88, y + 15, 17, 25); }
+    const tx = icon === 'yellow' || icon === 'red' ? x + 118 : x + 90;
+    const lines = wrap(text, 650, fit(text, 650, 19, w - (tx - x) - 20, 14), w - (tx - x) - 20, 2);
     ctx.fillStyle = '#f8fafc'; ctx.textAlign = 'left';
     const fs = fit(lines[0], 650, 19, w - (tx - x) - 20, 14);
     ctx.font = `650 ${fs}px ${FONT}`;
     lines.forEach((ln, i) => ctx.fillText(ln, tx, y + 28.5 + (i - (lines.length - 1) / 2) * (fs + 3)));
     ctx.restore();
-    return cap;
+  }
+  // The moment's description under the first replay angle (the live clip cuts away before it can be read).
+  function replayCaption(ctx, sc, local) {
+    const p = clamp((local - 300) / 350, 0, 1), q = clamp((sc.dur - 200 - local) / 250, 0, 1);
+    if (Math.min(p, q) <= 0) return;
+    drawLowerThird(ctx, sc.ev.side, minuteStr(sc.min, sc.add), sc.ev.text, null, Math.min(p, q), (1 - easeOut(p)) * 30);
   }
   function wipe(ctx, p, sc) {
     // Broadcast stinger: diagonal bands sweeping across.
@@ -666,11 +845,15 @@ export function createMatch({ teams }) {
   // Every cut is covered by a transition that straddles it: it starts in the outgoing scene, hides
   // the switch at its peak and resolves in the incoming one — like a broadcast highlights package.
   function fxFor(a, b) {
-    if (b.kind === 'clip' && b.isWipe) return { type: 'stinger', pre: 0.36, post: 0.46 };
-    if (b.kind === 'replay' || a.kind === 'replay' && b.kind !== 'freeze') return { type: 'replay', pre: 0.3, post: 0.4 };
-    if (b.kind === 'freeze') return { type: 'flash', pre: 0.06, post: 0.42 };
-    if (a.kind === 'freeze' || a.kind === 'var') return { type: 'stinger', pre: 0.36, post: 0.46 };
-    return { type: 'dip', pre: 0.24, post: 0.3 };
+    // into a replay: the REPLAY wipe; a second replay angle: a quick dip
+    if (b.kind === 'replay') return a.kind === 'replay' ? { type: 'dip', pre: 0.1, post: 0.14 } : { type: 'replay', pre: 0.24, post: 0.32 };
+    // into the analysis image: a flash, as if the picture froze
+    if (b.kind === 'freeze') return { type: 'flash', pre: 0.06, post: 0.36 };
+    // every live clip is a new moment of the match: team stinger with the minute
+    if (b.kind === 'clip') return { type: 'stinger', pre: 0.32, post: 0.4 };
+    // from the action to a full-screen graphic, and between graphics: a dip
+    if (a.kind === 'clip' || a.kind === 'replay' || a.kind === 'freeze') return { type: 'dip', pre: 0.28, post: 0.32 };
+    return { type: 'dip', pre: 0.2, post: 0.26 };
   }
   function sceneIndexAt(t) {
     const sc = built.scenes;
@@ -988,7 +1171,7 @@ export function createMatch({ teams }) {
   function drawLineup(ctx, sc, local) {
     dimBackdrop(ctx, sc.start + local);
     const side = sc.side, T = TEAMS[side], col = T.color;
-    const p = clamp(local / 500, 0, 1), out = clamp((sc.dur - local) / 400, 0, 1);
+    const p = clamp(local / 500, 0, 1), out = 1 /* the transition covers the way out */;
     ctx.save(); ctx.globalAlpha = Math.min(p, out);
     // Header
     ctx.fillStyle = col; ctx.fillRect(60, 56, 8, 56);
@@ -1038,25 +1221,7 @@ export function createMatch({ teams }) {
     });
     ctx.restore();
   }
-  function drawToss(ctx, sc, local) {
-    dimBackdrop(ctx, sc.start + local);
-    const p = local / sc.dur;
-    const flip = Math.min(1, p * 1.6);
-    const ang = flip * Math.PI * 7;
-    const side = sc.side;
-    ctx.save();
-    ctx.translate(W / 2, H / 2 - 40 - Math.sin(flip * Math.PI) * 120);
-    ctx.scale(1, Math.abs(Math.cos(ang)) * 0.9 + 0.1);
-    ctx.fillStyle = '#e5c158'; ctx.beginPath(); ctx.arc(0, 0, 56, 0, Math.PI * 2); ctx.fill();
-    ctx.strokeStyle = '#b8902c'; ctx.lineWidth = 5; ctx.stroke();
-    ctx.restore();
-    if (p > 0.62) {
-      ctx.save(); ctx.globalAlpha = clamp((p - 0.62) / 0.15, 0, 1);
-      ctx.textAlign = 'center'; ctx.fillStyle = '#fff'; ctx.font = `900 30px ${FONT}`;
-      ctx.fillText(`${TEAMS[side].name} win the toss and kick off`, W / 2, H / 2 + 110);
-      ctx.restore();
-    }
-  }
+
   function statRows(ctx, rows, x, y, w) {
     rows.forEach(([label, a, b, fmt], i) => {
       const yy = y + i * 44;
@@ -1091,7 +1256,7 @@ export function createMatch({ teams }) {
   }
   function drawHT(ctx, sc, local) {
     dimBackdrop(ctx, sc.start + local);
-    const p = clamp(local / 500, 0, 1), out = clamp((sc.dur - local) / 400, 0, 1);
+    const p = clamp(local / 500, 0, 1), out = 1 /* the transition covers the way out */;
     ctx.save(); ctx.globalAlpha = Math.min(p, out);
     panel(ctx, 200, 60, 880, 600);
     scoreHeader(ctx, 'HALF-TIME', sc.score, 110);
@@ -1100,29 +1265,10 @@ export function createMatch({ teams }) {
     statRows(ctx, [['Shots', s.shots[0], s.shots[1]], ['On target', s.onT[0], s.onT[1]], ['Corners', s.corners[0], s.corners[1]], ['Fouls', s.fouls[0], s.fouls[1]], ['Offsides', s.offsides[0], s.offsides[1]], ['Yellow cards', s.yellow[0], s.yellow[1]], ['Red cards', s.red[0], s.red[1]]], 300, 270, 680);
     ctx.restore();
   }
-  function drawSwitch(ctx, sc, local) {
-    dimBackdrop(ctx, sc.start + local);
-    const p = easeInOut(clamp(local / 1800, 0, 1));
-    const cx = W / 2, cy = H / 2 + 10, pw = 520, ph = 300;
-    ctx.save();
-    ctx.fillStyle = '#1f6b37'; D.roundRect(ctx, cx - pw / 2, cy - ph / 2, pw, ph, 10); ctx.fill();
-    ctx.strokeStyle = 'rgba(255,255,255,0.6)'; ctx.lineWidth = 2; ctx.strokeRect(cx - pw / 2 + 10, cy - ph / 2 + 10, pw - 20, ph - 20);
-    ctx.beginPath(); ctx.moveTo(cx, cy - ph / 2 + 10); ctx.lineTo(cx, cy + ph / 2 - 10); ctx.stroke();
-    // Team blocks swap halves
-    const ax = lerp(cx - pw / 4, cx + pw / 4, p), bxx = lerp(cx + pw / 4, cx - pw / 4, p);
-    const arc = Math.sin(p * Math.PI) * 60;
-    for (const [x, col, name, dy] of [[ax, TEAMS.A.color, TEAMS.A.name, -arc], [bxx, TEAMS.B.color, TEAMS.B.name, arc]]) {
-      ctx.fillStyle = col; ctx.beginPath(); ctx.arc(x, cy + dy, 34, 0, Math.PI * 2); ctx.fill();
-      ctx.fillStyle = lum(col) > 0.62 ? '#111' : '#fff'; ctx.font = `900 16px ${FONT}`; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-      ctx.fillText(short3(name), x, cy + dy + 1);
-    }
-    ctx.fillStyle = '#fff'; ctx.font = `900 30px ${FONT}`; ctx.textAlign = 'center';
-    ctx.fillText('SIDES SWITCH FOR THE SECOND HALF', cx, cy - ph / 2 - 40);
-    ctx.restore();
-  }
+
   function drawFT(ctx, sc, local) {
     dimBackdrop(ctx, sc.start + local);
-    const p = clamp(local / 500, 0, 1), out = clamp((sc.dur - local) / 400, 0, 1);
+    const p = clamp(local / 500, 0, 1), out = 1 /* the transition covers the way out */;
     ctx.save(); ctx.globalAlpha = Math.min(p, out);
     panel(ctx, 180, 40, 920, 640);
     scoreHeader(ctx, 'FULL TIME', sc.score, 92);
@@ -1144,7 +1290,7 @@ export function createMatch({ teams }) {
     const m = stats?.motm; if (!m) return;
     const side = m.side === 'B' ? 'B' : 'A';
     const pl = playerByName(side, m.player);
-    const p = clamp(local / 600, 0, 1), out = clamp((sc.dur - local) / 400, 0, 1);
+    const p = clamp(local / 600, 0, 1), out = 1 /* the transition covers the way out */;
     ctx.save(); ctx.globalAlpha = Math.min(p, out);
     const r = 150 * (0.7 + 0.3 * backOut(p));
     if (pl) photoCircle(ctx, pl.id, 360, H / 2, r, TEAMS[side].color);
@@ -1159,7 +1305,7 @@ export function createMatch({ teams }) {
   }
   function drawRatings(ctx, sc, local) {
     dimBackdrop(ctx, sc.start + local);
-    const p = clamp(local / 500, 0, 1), out = clamp((sc.dur - local) / 400, 0, 1);
+    const p = clamp(local / 500, 0, 1), out = 1 /* the transition covers the way out */;
     ctx.save(); ctx.globalAlpha = Math.min(p, out);
     ctx.fillStyle = '#ffd34d'; ctx.font = `900 18px ${FONT}`; ctx.textAlign = 'center'; ctx.fillText('PLAYER RATINGS', W / 2, 60);
     ['A', 'B'].forEach((side, si) => {
@@ -1187,7 +1333,7 @@ export function createMatch({ teams }) {
     dimBackdrop(ctx, sc.start + local);
     const a = analysis[sc.side]; if (!a) return;
     const col = TEAMS[sc.side].color;
-    const p = clamp(local / 500, 0, 1), out = clamp((sc.dur - local) / 400, 0, 1);
+    const p = clamp(local / 500, 0, 1), out = 1 /* the transition covers the way out */;
     ctx.save(); ctx.globalAlpha = Math.min(p, out);
     ctx.fillStyle = col; ctx.fillRect(0, 0, 14, H);
     ctx.fillStyle = '#fff'; ctx.font = `italic 900 ${fit(TEAMS[sc.side].name, 900, 40, 760, 20, true)}px ${FONT}`; ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
@@ -1330,7 +1476,6 @@ export function createMatch({ teams }) {
     switch (sc.kind) {
       case 'intro': drawIntro(ctx, sc, local); break;
       case 'lineup': drawLineup(ctx, sc, local); break;
-      case 'toss': drawToss(ctx, sc, local); break;
       case 'clip': {
         const ct = (sc.trimStart || 0) + local / 1000;
         drawClip(ctx, sc, ct, 'live');
@@ -1345,20 +1490,22 @@ export function createMatch({ teams }) {
         break;
       }
       case 'replay': {
-        const ct = sc.from + (local / 1000) * sc.slow;
+        const ct = rampCt(sc, local);
         drawClip(ctx, sc, ct, sc.cam, { noTags: false });
         // Replay bug + letterbox vignette
         ctx.fillStyle = 'rgba(0,0,0,0.25)'; ctx.fillRect(0, 0, W, 34); ctx.fillRect(0, H - 34, W, 34);
         ctx.fillStyle = '#f8fafc'; D.roundRect(ctx, W - 176, 44, 140, 32, 6); ctx.fill();
         ctx.fillStyle = TEAMS[sc.ev.side || 'A'].color; ctx.beginPath(); ctx.arc(W - 156, 60, 7 + Math.sin(local / 140) * 1.5, 0, Math.PI * 2); ctx.fill();
         ctx.fillStyle = '#111'; ctx.font = `900 15px ${FONT}`; ctx.textAlign = 'left'; ctx.textBaseline = 'middle'; ctx.fillText('REPLAY', W - 140, 61);
-        if (!noHud) scorebug(ctx, { ...sc, goalAt: null }, t, sc.from);
+        if (!noHud) {
+          scorebug(ctx, { ...sc, goalAt: null }, t, sc.from);
+          if (sc.angle === 0 && sc.ev.text) replayCaption(ctx, sc, local);
+        }
         break;
       }
       case 'freeze': drawFreeze(ctx, sc, local); break;
       case 'var': drawVar(ctx, sc, local); break;
       case 'ht': drawHT(ctx, sc, local); break;
-      case 'switch': drawSwitch(ctx, sc, local); break;
       case 'ft': drawFT(ctx, sc, local); break;
       case 'motm': drawMotm(ctx, sc, local); break;
       case 'ratings': drawRatings(ctx, sc, local); break;
@@ -1385,9 +1532,9 @@ export function createMatch({ teams }) {
     if (!sc) return { minute: '', score: [0, 0], sceneType: '', text: '', eventIndex: -1, fullTimeReached: false };
     let minute = '', score = sc.scoreBefore ? scoreAt(sc, t) : (sc.score || built.state.score);
     if (sc.kind === 'clip' || sc.kind === 'replay' || sc.kind === 'freeze' || sc.kind === 'var') minute = minuteStr(sc.min, sc.add);
-    if (sc.kind === 'ht' || sc.kind === 'switch') minute = 'HT';
+    if (sc.kind === 'ht') minute = 'HT';
     if (['ft', 'motm', 'ratings', 'analysis', 'montage', 'end'].includes(sc.kind)) { minute = 'FT'; score = built.state.score; }
-    if (['intro', 'lineup', 'toss'].includes(sc.kind)) { minute = ''; score = [0, 0]; }
+    if (['intro', 'lineup'].includes(sc.kind)) { minute = ''; score = [0, 0]; }
     const ftStart = typeof built.state.ftStart === 'number' ? built.state.ftStart : (built.state.ftWhistle ?? Infinity);
     return { minute, score, sceneType: sc.kind === 'clip' ? (sc.ev?.type || 'clip') : sc.kind, text: sc.ev?.text || '', eventIndex: sc.idx ?? -1, fullTimeReached: t >= ftStart };
   }
@@ -1413,6 +1560,9 @@ export function createMatch({ teams }) {
       img.src = p.img;
     })));
     stage3d = await stageP;
+    // Real faces: landmarks + hair (worker) and a baked head per photo. The 3D view works meanwhile
+    // with plain heads; wait at most a few seconds so the rehearsal below sees the final heads.
+    if (stage3d?.prepareFaces) await Promise.race([stage3d.prepareFaces(photoImgs).catch(e => console.warn('faces', e)), new Promise(r => setTimeout(r, 15000))]);
     lookCache = null;
     montageCache = null; thumbCache.clear(); warmed.clear();
     scheduleWarm();
@@ -1465,12 +1615,13 @@ export function createMatch({ teams }) {
     score: () => [...(built.state?.score || [0, 0])],
     timeline: () => built.tl,
     moments: () => built.moments,
-    scenes: () => built.scenes.map(s => ({ kind: s.kind, start: s.start, dur: s.dur, type: s.ev?.type, outcome: s.ev?.outcome })),
+    scenes: () => built.scenes.map(s => ({ kind: s.kind, start: s.start, dur: s.dur, type: s.ev?.type, outcome: s.ev?.outcome, card: s.ev?.card, min: s.min, add: s.add, in: s.trimStart, out: s.outT, cam: s.cam })),
     teams: TEAMS,
   };
 }
 
-// Skin tone and hair colour sampled from the player's photo (white/grey background ignored).
+// Skin tone and hair colour sampled from the player's photo (white/grey background ignored), for
+// the 2D graphics and until the 3D face is ready (three/face.js fits the photo onto the 3D head).
 function sampleLook(img) {
   const c = document.createElement('canvas'); c.width = 30; c.height = 39;
   const x = c.getContext('2d', { willReadFrequently: true });
@@ -1493,30 +1644,6 @@ function sampleLook(img) {
   const skin = face ? hex(face) : '#c8956b';
   let hairC = hair ? hex(hair) : null;
   if (hair && face && Math.abs(hair[0] - face[0]) + Math.abs(hair[1] - face[1]) < 40) hairC = null; // bald / shaved
-  return { skin, hair: hairC, faceXf: faceFraming(img) };
+  return { skin, hair: hairC };
 }
 
-// Where the head sits in the portrait: Transfermarkt crops tightly (head ≈ 84% of the width,
-// touching the top). Measure the silhouette width and centre at forehead height and map the 3D
-// head onto it ([u scale, u offset, v scale, v offset] for the face shader).
-function faceFraming(img) {
-  const W = 75, H = 98;
-  const c = document.createElement('canvas'); c.width = W; c.height = H;
-  const x = c.getContext('2d', { willReadFrequently: true });
-  x.drawImage(img, 0, 0, W, H);
-  const d = x.getImageData(0, 0, W, H).data;
-  const at = (xx, yy, k) => d[(yy * W + xx) * 4 + k];
-  const bg = [0, 1, 2].map(k => (at(1, 1, k) + at(W - 2, 1, k) + at(1, 5, k) + at(W - 2, 5, k)) / 4);
-  const fg = (xx, yy) => Math.abs(at(xx, yy, 0) - bg[0]) + Math.abs(at(xx, yy, 1) - bg[1]) + Math.abs(at(xx, yy, 2) - bg[2]) > 60;
-  const ws = [], cs = [];
-  for (let yy = Math.round(H * 0.14); yy < Math.round(H * 0.24); yy++) {
-    let a = -1, b = -1;
-    for (let xx = 0; xx < W; xx++) if (fg(xx, yy)) { if (a < 0) a = xx; b = xx; }
-    if (a >= 0 && b - a > 4) { ws.push((b - a) / W); cs.push((a + b) / 2 / W); }
-  }
-  const med = v => v.sort((p, q) => p - q)[Math.floor(v.length / 2)];
-  const w = ws.length ? med(ws) : 0.84, cx = cs.length ? med(cs) : 0.5;
-  const su = Math.min(0.97, Math.max(0.76, 0.86 * (w / 0.84)));
-  const ou = Math.min(0.2, Math.max(-0.05, cx - su / 2));
-  return [su, ou, 0.78, 0.14];
-}
