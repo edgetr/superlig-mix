@@ -216,7 +216,7 @@ function* possession(w, side, { objective, final = null, finalSpot = null, budge
 // ------------------------------------------------------------------ keeper
 // Reacts to the shot: set as it's struck, then a dive along the line (or a catch at the body)
 // to where the ball crosses him. mode: 'beaten' | 'catch' | 'parry' | 'tip' | 'watch'.
-function* keeperVsShot(w, gk, shooter, mode, outDir) {
+function* keeperVsShot(w, gk, shooter, mode, outDir, penalty = false) {
   const ag = w.agents[gk];
   order(w, gk, { type: 'keeper', phase: 'watch', mode });
   const c = yield* waitEvent(w, 'commit', e => e.agent === shooter, 10);
@@ -225,7 +225,9 @@ function* keeperVsShot(w, gk, shooter, mode, outDir) {
   setAnim(w, gk, S.SET, 0.7);
   const k = yield* waitEvent(w, 'kick', e => e.agent === shooter, 1.5);
   if (!k) return;
-  yield* wait(w, mode === 'beaten' ? 0.2 : 0.12);
+  // penalties: he goes as it's struck (and a beaten keeper may have guessed wrong); open play: reaction time
+  const guessWrong = penalty && mode === 'beaten' && w.rnd() < 0.55;
+  yield* wait(w, penalty ? 0.03 : mode === 'beaten' ? 0.24 : 0.13);
   const path = predict(w.ball, 2.2, 1 / 60);
   // where the ball passes the keeper's position (along the attack direction)
   const s = w.M.dir[ag.side];                              // keeper's team attacks +x if s > 0 → own goal at x = 0
@@ -240,11 +242,12 @@ function* keeperVsShot(w, gk, shooter, mode, outDir) {
     return;
   }
   // dive: launch sideways (with a little forward lean), body still facing the shooter
-  const sgn = Math.sign(dy) || 1;
+  let sgn = Math.sign(dy) || 1;
+  if (guessWrong) sgn = -sgn;
   // launch speed to carry his hands to the ball against the drag of the dive (friction f)
   const f = 2.6, carry = (1 - Math.exp(-f * T)) / f;
-  let sp = clamp((Math.abs(dy) - 0.8) / carry, 1.6, 8.5);
-  if (mode === 'beaten') sp = Math.min(sp * 0.6, Math.max(1.5, (Math.abs(dy) - 2.4) / carry));
+  // a full-length dive either way: beaten keepers get there a fraction late (or went the wrong way)
+  let sp = guessWrong ? 5.2 : clamp((Math.abs(dy) - 0.8) / carry, 2.6, 8.5);
   ag.vx = Math.cos(face) * 0.6; ag.vy = sgn * sp;
   ag.face = face;
   order(w, gk, { type: 'keeper', phase: 'dive', mode, diving: true, handOff: { x: 0, y: sgn * 0.75 }, outDir });
@@ -273,7 +276,6 @@ function* shotScript(w, ev, info) {
   const goalPt = outcome === 'woodwork' ? woodworkPoint(w, side, target) : goalPoint(w, side, target);
   const speed = SHOT_SPEED[technique] || (head ? 15 : 24);
   const shot = { target: { x: goalPt.x, y: goalPt.y, z: goalPt.z }, speed, spin: spinFor(w, side, technique, goalPt) };
-  if (isFK) shot.T = fkFlightTime(w, goalPt, shot);
   const gkMode = outcome === 'goal' || outcome === 'disallowed' ? 'beaten' : outcome === 'saved' ? 'catch' : outcome === 'parried' ? 'parry' : outcome === 'tipped' ? 'tip' : 'beaten';
   const outDir = unit(dir * 0.18, goalPt.y < 34 ? -1 : 1);
   info.outcome = outcome; info.shooter = shooter; info.gk = gk;
@@ -286,12 +288,13 @@ function* shotScript(w, ev, info) {
   else if (isFK) yield* freeKickSetup(w, side, shooter, ctx.setup, { u: su, v: sv });
   else if (isCorner) first = yield* cornerSetup(w, side, shooter, assister, head, sv);
   else first = yield* openPlay(w, ev, side, shooter, assister, { u: su, v: sv }, head, outcome);
+  if (isFK) shot.T = fkFlightTime(w, goalPt, shot);
 
   // --- the shot
   let blocker = null;
-  const keeperGen = keeperVsShot(w, gk, shooter, outcome === 'blocked' || outcome === 'off_target' ? 'watch' : gkMode, outDir);
+  const keeperGen = keeperVsShot(w, gk, shooter, outcome === 'blocked' || outcome === 'off_target' ? 'watch' : gkMode, outDir, isPen);
   if (first) {
-    order(w, shooter, { type: 'receive', first: first.head ? 'head' : 'shoot', spot: first.spot, then: { type: 'shoot', ...shot, speed: first.head ? 15 : Math.min(speed, 27) } });
+    order(w, shooter, { type: 'receive', first: first.head ? 'head' : 'shoot', spot: first.spot, then: { type: 'shoot', ...shot, speed: first.head ? 17 : Math.min(speed, 27), maxT: first.head ? 0.9 : null } });
   } else {
     if (w.owner !== shooter) { const e = yield* waitEvent(w, 'control', e => e.agent === shooter, 3); if (!e) { /* fallback */ } }
     order(w, shooter, { type: 'shoot', ...shot, minHold: isPen || isFK ? 0.05 : 0.1 });
@@ -320,9 +323,17 @@ function* shotScript(w, ev, info) {
   // run the keeper alongside, until the strike
   let kick = null;
   const t0 = w.t;
+  let fellBack = false, aimedAtBlock = false;
   while (!kick && w.t - t0 < 8) {
     keeperGen.next();
     if (w.owner === shooter || first) pickBlocker();
+    // the first-time chance didn't come off: he takes a touch and shoots instead
+    if (first && !fellBack && !since(w, t0, 'commit', e => e.agent === shooter)) {
+      const sa = w.agents[shooter], b = w.ball;
+      const away = Math.hypot(b.x - sa.x, b.y - sa.y) > 2.2 && (b.vx * (b.x - sa.x) + b.vy * (b.y - sa.y)) > 0;
+      if ((w.t - t0 > 0.6 && (away || Math.hypot(b.vx, b.vy) < 2)) || w.t - t0 > 3) { fellBack = true; order(w, shooter, { type: 'receive', next: goalPt }); }
+    }
+    if (fellBack && w.owner === shooter && w.agents[shooter].order?.type !== 'shoot') order(w, shooter, { type: 'shoot', ...shot, minHold: 0.15 });
     if (blocker != null && !w.agents[blocker].free) {
       const sa = w.agents[shooter], [gx, gy] = unit(goalPt.x - sa.x, goalPt.y - sa.y);
       const bo = w.agents[blocker].order; if (bo?.type === 'block') bo.at = { x: sa.x + gx * 2.4, y: sa.y + gy * 2.4 };
@@ -330,6 +341,18 @@ function* shotScript(w, ev, info) {
     kick = since(w, t0, 'kick', e => e.agent === shooter);
     const cm = since(w, t0, 'commit', e => e.agent === shooter);
     if (cm && blocker != null && !w.agents[blocker].free) { const bk = w.agents[blocker], sa = w.agents[shooter]; if (Math.hypot(bk.x - sa.x, bk.y - sa.y) < 4.5) setAnim(w, blocker, S.SLIDE, 1.4, false, 0); }
+    // scripted block: the shot goes through the line he's covering (still goalwards)
+    if (cm && blocker != null && !aimedAtBlock) {
+      aimedAtBlock = true;
+      const so = w.agents[shooter].order, bk = w.agents[blocker], b = w.ball;
+      if (so?.type === 'shoot') {
+        const dx = bk.x + bk.vx * 0.3 - b.x, dy = bk.y + bk.vy * 0.3 - b.y;
+        if (Math.abs(dx) > 0.5 && Math.sign(dx) === Math.sign(goalPt.x - b.x)) {
+          const k = (goalPt.x - b.x) / dx;
+          so.target = { x: goalPt.x, y: clamp(b.y + dy * k, POST_A - 3, POST_B + 3), z: 0.45 };
+        }
+      }
+    }
     if (!kick) yield;
   }
   if (!kick) { info.climax = w.t; yield* wait(w, 1); return; }
@@ -535,9 +558,16 @@ function* openPlay(w, ev, side, shooter, assister, SL, head, outcome) {
     order(w, m1, { type: 'mark', target: shooter, gap: 1.4 });
     if (second != null) { const m2 = nearestOf(w, opp, W(95, 34), ['CB', 'LB', 'RB', 'CDM'], [m1]); order(w, m2, { type: 'mark', target: second, gap: 1.1 }); }
     const T = type === 'cross' ? clamp(Math.hypot(spot0.x - ass.x, spot0.y - ass.y) / 19 + 0.55, 0.9, 1.6) : null;
+    // the delivery waits until the runner can get there (he holds it up, takes a touch, looks up)
+    const flight0 = type === 'cross' ? T : Math.hypot(spot0.x - ass.x, spot0.y - ass.y) / 15 + 0.1;
+    const [rx0, ry0] = unit(spot0.x - shooterA.x, spot0.y - shooterA.y);
+    const need = Math.hypot(spot0.x - shooterA.x, spot0.y - shooterA.y);
+    let tRun = 0; for (let d = 0; d < need && tRun < 6; tRun += 0.1) d = runDistance(shooterA, rx0, ry0, tRun) * 0.95;
+    const holdFor = clamp(tRun - flight0 - 0.28 - 0.1, 0, 2.6);
     const o = order(w, final, type === 'cross'
-      ? { type: 'cross', to: shooter, kind: 'cross', target: { x: spot0.x, y: spot0.y, z: head ? 1.95 : 0.55 }, T, minHold: 0.15 }
-      : { type: 'pass', to: shooter, kind: 'ground', target: spot0, vArr: 12, minHold: 0.12 });
+      ? { type: 'cross', to: shooter, kind: 'cross', target: { x: spot0.x, y: spot0.y, z: head ? 1.95 : 0.55 }, T, minHold: 0.15, notBefore: w.t + holdFor }
+      : { type: 'pass', to: shooter, kind: 'ground', target: spot0, vArr: 12, minHold: 0.12, notBefore: w.t + holdFor });
+    if (holdFor > 0.3) order(w, shooter, { type: 'run', hold: spot0, to: spot0, go: false });
     const cm = yield* waitEvent(w, 'commit', e => e.agent === final, 4);
     // he winds up: runners go, and the ball is aimed where the finisher will actually be
     const flight = type === 'cross' ? T : Math.hypot(spot0.x - ass.x, spot0.y - ass.y) / 15 + 0.1;
@@ -582,15 +612,20 @@ function* openPlay(w, ev, side, shooter, assister, SL, head, outcome) {
   }
   // short pass / lay-off into his feet at the edge of the box
   const spot = W(SL.u - 1, SL.v);
-  order(w, shooter, { type: 'goto', to: spot, speed: 6, faceBall: true, keepFace: true });
-  yield* until(w, () => Math.hypot(shooterA.x - spot.x, shooterA.y - spot.y) < 3, 1.6);
-  order(w, final, { type: 'pass', to: shooter, kind: 'ground', lead: false, minHold: 0.1 });
+  order(w, shooter, { type: 'goto', to: spot, speed: 7, faceBall: true, keepFace: false });
+  yield* until(w, () => Math.hypot(shooterA.x - spot.x, shooterA.y - spot.y) < 3, 3.5);
+  const near = Math.hypot(shooterA.x - spot.x, shooterA.y - spot.y) < 4;
+  order(w, final, { type: 'pass', to: shooter, kind: 'ground', lead: !near, minHold: 0.1 });
   const k = yield* waitEvent(w, 'kick', e => e.agent === final, 3);
-  const firstTime = rnd() < 0.4 || ev.technique === 'volley' || ev.technique === 'tap_in';
+  const firstTime = near && (rnd() < 0.4 || ev.technique === 'volley' || ev.technique === 'tap_in');
   w.marks.assist = { from: { x: ass.x, y: ass.y }, to: spot, type };
   if (firstTime && k) return { spot: null, head: false };
-  order(w, shooter, { type: 'receive', next: goalOf(w, side) });
+  order(w, shooter, { type: 'receive', next: SLw });
   yield* waitEvent(w, 'control', e => e.agent === shooter, (k?.T ?? 2) + 2);
+  if (!near && w.owner === shooter) {
+    order(w, shooter, { type: 'dribble', to: SLw, speed: 7 });
+    yield* until(w, () => Math.hypot(shooterA.x - SLw.x, shooterA.y - SLw.y) < 2.5 || w.owner !== shooter, 4);
+  }
   return null;
 }
 const unitObj = (x, y) => { const l = Math.hypot(x, y) || 1; return { dx: x / l, dy: y / l }; };
@@ -889,7 +924,7 @@ function* foulScript(w, ev, info) {
   const sliding = rnd() < 0.55;
   order(w, fouled, { type: 'dribble', to: { x: F.x + (dir > 0 ? 4 : -4), y: F.y }, speed: 6.4 });
   order(w, offender, { type: 'tackle', target: fouled, style: sliding ? 'slide' : 'lunge', outcome: 'foul', notBefore: w.t + 0.3 });
-  const f = yield* waitEvent(w, 'foul', () => true, 5);
+  const f = yield* waitEvent(w, 'foul', () => true, 9);
   w.protect = null;
   const tf = f ? f.t : w.t;
   info.climax = tf; info.protagonists = [fouled, offender]; info.offender = offender; info.fouled = fouled;

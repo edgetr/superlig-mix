@@ -475,7 +475,13 @@ function receiveCmd(w, ag) {
       if (Math.hypot(q.x - ag.x, q.y - ag.y) <= reach && q.z < (o.first === 'head' ? 2.8 : 1.6)) { p = q; tau = q.t; break; }
     }
   }
-  if (o.spot && w.flight) { p = o.spot; tau = Math.max(0.1, w.flight.t0 + w.flight.T - w.t); }
+  if (o.spot && w.flight && path) {
+    // meet the ball where its real path passes closest to the planned spot, when it gets there
+    let bq = null, bd = 1e9;
+    for (const q of path) { const d = Math.hypot(q.x - o.spot.x, q.y - o.spot.y); if (d < bd && q.z < (o.first === 'head' ? 3 : 1.6)) { bd = d; bq = q; } }
+    if (bq) { p = bq; tau = Math.max(0.05, bq.t); }
+    else { p = o.spot; tau = Math.max(0.1, w.flight.t0 + w.flight.T - w.t); }
+  } else if (o.spot && w.flight) { p = o.spot; tau = Math.max(0.1, w.flight.t0 + w.flight.T - w.t); }
   else if (w.flight && w.flight.receiver === ag.id && w.flight.target && ['through', 'lofted', 'cross'].includes(w.flight.kind)) {
     // played into space / over the top: run onto it, don't come back for it
     const ft = w.flight.target, tl = Math.max(0.1, w.flight.t0 + w.flight.T - w.t);
@@ -494,10 +500,12 @@ function tackleCmd(w, ag) {
   const lead = o.style === 'slide' ? 0.45 : 0.25;
   const px = tg.x + tg.vx * lead, py = tg.y + tg.vy * lead;
   const d = Math.hypot(px - ag.x, py - ag.y);
-  if (w.t >= (o.notBefore ?? 0) && d < (o.style === 'slide' ? 3.0 : 1.5)) {
+  // a foul has to make contact: commit only when the slide/lunge will actually get there
+  const closing = o.outcome === 'foul' ? (speedOf(tg) < speedOf(ag) + 1.5 || d < 1.6) : true;
+  if (w.t >= (o.notBefore ?? 0) && d < (o.style === 'slide' ? 3.0 : 1.5) && closing) {
     o.committed = true; o.ct = w.t;
     const [ux, uy] = unit(px - ag.x, py - ag.y);
-    const v = o.style === 'slide' ? Math.max(5.2, speedOf(ag)) : 2.8;
+    const v = o.style === 'slide' ? Math.max(5.2, speedOf(ag), speedOf(tg) + 1.8) : Math.max(2.8, speedOf(tg) + 1);
     ag.vx = ux * v; ag.vy = uy * v; ag.face = Math.atan2(uy, ux);
     if (o.style === 'slide') setAnim(w, ag.id, S.SLIDE, 1.5, true, 2.1);
     else setAnim(w, ag.id, S.LUNGE, 0.75, true, 3.5);
@@ -600,10 +608,12 @@ function separate(w) {
     for (let j = i + 1; j <= REF; j++) {
       const b = w.agents[j]; if (b.gone) continue;
       const duel = a.duel === j || b.duel === i;
-      const minD = duel ? 0.42 : a.free || b.free ? 0.5 : 0.62;
+      const minD = duel ? 0.45 : a.free || b.free ? 0.5 : 0.64;
       const dx = a.x - b.x, dy = a.y - b.y, d2 = dx * dx + dy * dy;
       if (d2 >= minD * minD || d2 < 1e-8) continue;
-      const d = Math.sqrt(d2), push = Math.min(0.022, (minD - d) * 0.3), ux = dx / d, uy = dy / d;
+      // shoulder-to-shoulder with the man on the ball is a firm contact; elsewhere a gentle ease apart
+      const firm = i === w.owner || j === w.owner || a.order?.type === 'mark' || b.order?.type === 'mark';
+      const d = Math.sqrt(d2), push = Math.min(firm ? 0.05 : 0.022, (minD - d) * (firm ? 0.5 : 0.3)), ux = dx / d, uy = dy / d;
       const wa = j === w.owner ? 1.6 : i === w.owner ? 0.4 : 1, wb = 2 - wa;
       a.x += ux * push * wa; a.y += uy * push * wa; b.x -= ux * push * wb; b.y -= uy * push * wb;
     }
@@ -655,10 +665,13 @@ function dribbleTouch(w, ag) {
   if (ahead < -0.25 && sp > 2) return;
   // knock it into the stride he wants (speeding up touch by touch), not just his current pace
   const want = dr.want ?? sp;
-  const v = sp > 1.4 || want > 2 ? Math.min(want, sp + 2.2) + dr.push : Math.max(0.45, sp + 0.35);
+  // close control under pressure: small touches; in space: knock it on and run
+  const opp = nearestOpp(w, ag, 6);
+  const press = opp ? clamp((4.5 - Math.hypot(opp.x - ag.x, opp.y - ag.y)) / 3, 0, 1) : 0;
+  const v = sp > 1.4 || want > 2 ? Math.min(want, sp + lerp(1.6, 0.4, press)) + dr.push * (1 - press * 0.8) : Math.max(0.45, sp + 0.35);
   b.vx = dr.dx * v; b.vy = dr.dy * v; b.vz = 0; b.z = R;
   b.wx = b.wy = b.wz = 0;
-  ag.touchCd = w.t + (sp > 4 ? 0.42 : sp > 1.5 ? 0.32 : 0.5);
+  ag.touchCd = w.t + (press > 0.4 ? 0.24 : sp > 4 ? 0.42 : sp > 1.5 ? 0.32 : 0.5);
   w.lastTouch = ag.id;
   w.marks.touches.push({ agent: ag.id, t: w.t, kind: 'dribble' });
 }
@@ -706,7 +719,10 @@ function kickTarget(w, ag, o) {
     const d = Math.hypot(px - b.x, py - b.y);
     const T = o.kind === 'lofted' || o.kind === 'cross' ? d / 18 + 0.45 : d / 13 + 0.2;
     const k = o.lead ? 1 : 0.55;
-    px = r.x + r.vx * T * k + (o.leadDir ? o.leadDir[0] * T * 1.5 : 0); py = r.y + r.vy * T * k + (o.leadDir ? o.leadDir[1] * T * 1.5 : 0);
+    let lx = r.vx * T * k + (o.leadDir ? o.leadDir[0] * T * 1.5 : 0), ly = r.vy * T * k + (o.leadDir ? o.leadDir[1] * T * 1.5 : 0);
+    const ll = Math.hypot(lx, ly), cap = o.lead ? 7 : 3.5;            // into his path, not miles ahead of him
+    if (ll > cap) { lx *= cap / ll; ly *= cap / ll; }
+    px = r.x + lx; py = r.y + ly;
   }
   return { x: clamp(px, 0.5, L - 0.5), y: clamp(py, 0.5, WD - 0.5), z: o.target?.z };
 }
@@ -721,6 +737,7 @@ function strike(w, ag) {
   const d = Math.hypot(tgt.x - from.x, tgt.y - from.y);
   if (o.type === 'shoot') {
     T = o.T ?? clamp(d / (o.speed || 24), 0.25, 2.2);
+    if (o.maxT) T = Math.min(T, o.maxT);
     v = solveFlight(from, { x: tgt.x, y: tgt.y, z: tgt.z ?? 0.3 }, T, o.spin || {});
     kind = 'shot';
   } else if (kind === 'ground' || kind === 'through') {
@@ -749,7 +766,7 @@ function firstTime(w, ag) {
     if (!w.path) return;
     // when will the ball be at my contact point?
     for (const q of w.path) {
-      const dd = Math.hypot(q.x - ag.x, q.y - ag.y);
+      const dd = Math.hypot(q.x - (ag.x + ag.vx * q.t * 0.9), q.y - (ag.y + ag.vy * q.t * 0.9));
       const zok = head ? q.z > 1.3 && q.z < 2.9 : q.z < 1.2;
       if (dd < (head ? 1.2 : 1.4) && zok && q.t <= lead + 0.06 && q.t >= lead - 0.12) {
         ag.ft = { at: w.t + q.t };
@@ -812,8 +829,8 @@ function tackles(w) {
     if (o?.type !== 'tackle' || !o.committed || o.resolved) continue;
     const tg = w.agents[o.target];
     const d = Math.hypot(tg.x - ag.x, tg.y - ag.y);
-    const reach = o.style === 'slide' ? 1.1 : 0.85;
-    if (d < reach || (o.outcome === 'foul' && w.t - o.ct > 0.55 && d < 1.8)) {
+    const reach = o.style === 'slide' ? 1.1 : o.outcome === 'foul' ? 1.15 : 0.85;
+    if (d < reach || (o.outcome === 'foul' && w.t - o.ct > 0.45 && d < 2.3)) {
       o.resolved = true;
       if (o.outcome === 'foul') {
         const [ux, uy] = unit(tg.vx || Math.cos(tg.face), tg.vy || Math.sin(tg.face));
@@ -839,7 +856,9 @@ function keeperContact(w) {
     const o = ag.order;
     if (!ag.isGK || o?.type !== 'keeper' || !o.mode || o.mode === 'beaten' || o.mode === 'watch' || o.touched) continue;
     if (!w.flight || w.flight.kind !== 'shot') continue;
-    const reach = o.diving ? 1.35 : 1.0;
+    // full stretch: fingertips find it as it reaches the line
+    const gl = toWorld(w.M.dir[ag.side], 0, 34).x, toLine = Math.abs(b.x - gl);
+    const reach = (o.diving ? 1.35 : 1.0) + (toLine < 2.5 ? (2.5 - toLine) * 0.45 : 0);
     // hands: diving keepers reach along the dive; standing keepers at the body
     const hx = ag.x + (o.handOff?.x || 0), hy = ag.y + (o.handOff?.y || 0);
     const d = Math.hypot(b.x - hx, b.y - hy);

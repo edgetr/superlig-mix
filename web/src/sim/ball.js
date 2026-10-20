@@ -131,13 +131,14 @@ export function groundForArrival(from, to, vArr) {
 // with drag and spin. Shooting method: simulate, correct by the miss, repeat.
 export function solveFlight(from, to, T, spin = { wx: 0, wy: 0, wz: 0 }) {
   let vx = (to.x - from.x) / T, vy = (to.y - from.y) / T, vz = ((to.z ?? R) - (from.z ?? R) + 0.5 * G * T * T) / T;
-  for (let i = 0; i < 14; i++) {
+  for (let i = 0; i < 40; i++) {
     const b = makeBall(from.x, from.y, from.z ?? R);
     Object.assign(b, { vx, vy, vz, wx: spin.wx || 0, wy: spin.wy || 0, wz: spin.wz || 0 });
     flyNoBounce(b, T);
     const ex = to.x - b.x, ey = to.y - b.y, ez = (to.z ?? R) - b.z;
-    if (Math.hypot(ex, ey, ez) < 0.01) break;
-    vx += ex / T; vy += ey / T; vz += ez / T;
+    if (Math.hypot(ex, ey, ez) < 0.004) break;
+    const k = i < 20 ? 1 : 0.6;            // damped once close (strong curl couples the axes)
+    vx += (ex / T) * k; vy += (ey / T) * k; vz += (ez / T) * k;
   }
   return { vx, vy, vz, wx: spin.wx || 0, wy: spin.wy || 0, wz: spin.wz || 0, T };
 }
