@@ -383,7 +383,8 @@ export function createMatchScreen({ client, api, getSess, toast, serverNow }) {
     if (!r.sim?.jobId) return;
     const fresh = jobId !== r.sim.jobId;
     ensureMatch(r);
-    if (fresh) match.preload?.().then(() => match.rehearse?.());
+    // Start after the line-ups entrance animation so the two never compete for frames.
+    if (fresh) { const m = match; setTimeout(() => m.preload?.().then(() => m.rehearse?.()), 1800); }
   }
   function show(on) {
     if (on === visible) return;
