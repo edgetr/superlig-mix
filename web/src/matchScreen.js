@@ -17,10 +17,13 @@ export function createMatchScreen({ client, api, getSess, toast, serverNow }) {
   canvas.width = W; canvas.height = H;
   const ctx = canvas.getContext('2d', { alpha: false });
   // Render at the display's real resolution (Retina etc.); the scene is drawn in 1280×720 units.
+  // Phones/tablets and slow GPUs get a lighter resolution; `quality` drops further if frames are slow.
+  const coarse = typeof matchMedia !== 'undefined' && matchMedia('(pointer: coarse)').matches;
+  let quality = 1;
   function fitCanvas() {
     const r = canvas.getBoundingClientRect();
-    const dpr = window.devicePixelRatio || 1;
-    const w = Math.max(W, Math.min(2560, Math.round(r.width * dpr) || W));
+    const dpr = Math.min(window.devicePixelRatio || 1, coarse ? 1.5 : 2) * quality;
+    const w = Math.max(W, Math.min(coarse ? 1600 : 2560, Math.round(r.width * dpr) || W));
     const h = Math.round((w * H) / W);
     if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; lastDrawT = -1; }
     ctx.setTransform(w / W, 0, 0, w / W, 0, 0);
@@ -82,6 +85,7 @@ export function createMatchScreen({ client, api, getSess, toast, serverNow }) {
       const t0 = performance.now();
       match.render(ctx, t);
       const t1 = performance.now();
+      adapt(t1 - t0);
       lastDrawT = t; lastDrawLen = items.length;
       updateProgress(t);
       renderSide(false);
@@ -90,6 +94,15 @@ export function createMatchScreen({ client, api, getSess, toast, serverNow }) {
     }
     handleBuffering();
     if (match.warmAround && (loop.n = (loop.n || 0) + 1) % 90 === 0) match.warmAround(t);
+  }
+
+  // If the GPU can't keep up (frames regularly over ~22 ms), render at a lower resolution.
+  let slow = 0, fast = 0;
+  function adapt(ms) {
+    const gap = performance.now() - (adapt.last || 0); adapt.last = performance.now();
+    if (gap > 200) return;                         // first frame after a pause
+    if (gap > 22 && quality > 0.5) { if (++slow > 45) { quality = Math.max(0.5, quality * 0.8); slow = 0; fitCanvas(); } }
+    else slow = Math.max(0, slow - 1);
   }
 
   function handleBuffering() {

@@ -378,7 +378,7 @@ export function createMatch({ teams }) {
     const kit = role === 'GK' ? kits['gk' + side] : kits[side];
     const lk = looks.get(p.id) || { skin: '#c8956b', hair: '#2b1d14' };
     const gk = role === 'GK';
-    return { ...kit, skin: lk.skin, hair: lk.hair, num: p.num ?? slot + 1, name: p.name, id: p.id, side, foot: p.foot || 'right', height: p.height ? p.height / 100 : 1.8,
+    return { ...kit, skin: lk.skin, hair: lk.hair, faceXf: lk.faceXf, num: p.num ?? slot + 1, name: p.name, id: p.id, side, foot: p.foot || 'right', height: p.height ? p.height / 100 : 1.8,
       boots: ['#111111', '#f8fafc', '#facc15', '#ef4444', '#22d3ee'][(Number(p.id) || slot) % 5], gloves: gk ? '#f8fafc' : null, longSleeve: gk };
   }
   let lookCache = null, lookVersion = 0;
@@ -401,6 +401,37 @@ export function createMatch({ teams }) {
     for (let tt = ct - win; tt <= ct + win; tt += 0.1) { const k = clamp(Math.round(tt * HZ), 0, c.N - 1); x += c.pos[(k * 25 + ag) * 2]; y += c.pos[(k * 25 + ag) * 2 + 1]; n++; }
     return { x: x / n, y: y / n };
   }
+  const angleMemo = new WeakMap();
+  function celebAngle(c, sc, tt) {
+    let memo = angleMemo.get(c); if (!memo) angleMemo.set(c, memo = new Map());
+    const key = Math.round(tt * 2);
+    if (memo.has(key)) return memo.get(key);
+    const p = avgPos(c, sc, tt, 0.6);
+    const a0 = avgPos(c, sc, tt - 0.6, 0.5), a1 = avgPos(c, sc, tt + 0.6, 0.5);
+    const vx = a1.x - a0.x, vy = a1.y - a0.y, vl = Math.hypot(vx, vy);
+    const run = vl > 0.4 ? clamp(Math.atan2(vx, vy), -1.05, 1.05) * smooth(clamp((vl - 0.4) / 1.2, 0, 1)) : 0;
+    const f = clamp(Math.round(tt * HZ), 0, c.N - 1);
+    let best = run, bestS = Infinity;
+    for (let th = -1.05; th <= 1.051; th += 0.15) {
+      const cx = p.x + Math.sin(th) * 7.2, cy = p.y + Math.cos(th) * 7.2;
+      let occ = 0;
+      for (let ag = 0; ag < 25; ag++) {
+        if (ag === sc) continue;
+        const ax = c.pos[(f * 25 + ag) * 2], ay = c.pos[(f * 25 + ag) * 2 + 1];
+        if (ax < -20) continue;
+        // distance from the agent to the camera→scorer segment
+        const sx = p.x - cx, sy = p.y - cy, l2 = sx * sx + sy * sy;
+        const u = clamp(((ax - cx) * sx + (ay - cy) * sy) / l2, 0, 1);
+        if (u > 0.92) continue;
+        const dd = Math.hypot(cx + sx * u - ax, cy + sy * u - ay);
+        if (dd < 0.9) occ += (0.9 - dd) * (0.4 + u);
+      }
+      const score = occ * 4 + Math.abs(th - run) * 0.8;
+      if (score < bestS) { bestS = score; best = th; }
+    }
+    memo.set(key, best);
+    return best;
+  }
   function clipCamera(sc, ct, mode) {
     const c = sc.clip, f = clamp(ct * HZ, 0, c.N - 1), i = Math.floor(f), j = Math.min(i + 1, c.N - 1), a = f - i;
     const bx = lerp(c.ball[i * 3], c.ball[j * 3], a), by = lerp(c.ball[i * 3 + 1], c.ball[j * 3 + 1], a);
@@ -408,8 +439,14 @@ export function createMatch({ teams }) {
       const m = c.marks;
       // Celebration: cut to a close camera on the scorer.
       if (m.goalT != null && m.celebrate && ct > m.goalT + 1.3) {
-        const p = avgPos(c, m.celebrate.scorer, ct, 0.6);
-        return D.camera([p.x + 7.5, p.y + 11.5, 3.9], [p.x, p.y, 1.05], 34);
+        // In front of the scorer (he's running at the camera side), never crossing the line:
+        // the camera comes from the near touchline and swings up to 60° to see his face.
+        const sc = m.celebrate.scorer, p = avgPos(c, sc, ct, 0.6);
+        // Pick the clearest angle (nobody standing in the way), re-evaluated every 0.5 s and blended.
+        const k0 = Math.floor(ct / 0.5) * 0.5, w = smooth((ct - k0) / 0.5);
+        const ang = lerp(celebAngle(c, sc, k0), celebAngle(c, sc, k0 + 0.5), w);
+        const d = 7.2;
+        return D.camera([p.x + Math.sin(ang) * d, p.y + Math.cos(ang) * d, 2.4], [p.x, p.y, 1.2], 30);
       }
       // Booking: close on the referee and the player.
       if (m.card && ct > m.card.t - 0.3 && ct < m.card.t + 2.5) {
@@ -435,8 +472,15 @@ export function createMatch({ teams }) {
       return D.broadcastCam(cx, z, lookY(c, ct));
     }
     if (mode === 'goal') {
-      const side = sc.ev.side || 'A', dir = sc.M.dir[side];
-      return D.behindGoalCam(dir > 0 ? C.L : 0, by);
+      // Behind the goal, lens tightening on the ball as the move comes towards the camera.
+      const side = sc.ev.side || 'A', dir = sc.M.dir[side], gx = dir > 0 ? C.L : 0, sgn = dir > 0 ? 1 : -1;
+      let sx = 0, sy = 0, n = 0;
+      for (let k = -4; k <= 4; k++) { const f2 = clamp(Math.round((ct + k * 0.1) * HZ), 0, c.N - 1); sx += c.ball[f2 * 3]; sy += c.ball[f2 * 3 + 1]; n++; }
+      const lx = sx / n, ly = sy / n;
+      const pos = [gx + sgn * 8.5, 34 + (ly - 34) * 0.35, 5.2];
+      const dist = Math.hypot(pos[0] - lx, pos[1] - ly);
+      const fov = clamp((2 * Math.atan(10 / Math.max(dist, 1)) * 180) / Math.PI, 24, 56);
+      return D.camera(pos, [lx, ly, 0.9], fov);
     }
     if (mode === 'reverse') return D.reverseCam(bx, by);
     if (mode === 'close') return D.closeCam(bx, by, 1);
@@ -642,7 +686,12 @@ export function createMatch({ teams }) {
     ctx.save();
     const inP = clamp(p / 0.45, 0, 1), outP = clamp((4.4 - p) / 0.4, 0, 1);
     ctx.globalAlpha = Math.min(1, outP);
-    // Big kinetic GOAL
+    // Big kinetic GOAL, then it shrinks into a banner at the top so the celebration is visible.
+    const shrink = easeInOut(clamp((p - 0.85) / 0.55, 0, 1));
+    ctx.save();
+    ctx.translate(W / 2, (H / 2 - 40) * (1 - shrink) + 92 * shrink);
+    ctx.scale(1 - 0.55 * shrink, 1 - 0.55 * shrink);
+    ctx.translate(-W / 2, -(H / 2 - 40));
     const letters = 'GOAL'.split('');
     ctx.font = `italic 950 150px ${FONT}`;
     ctx.textBaseline = 'middle'; ctx.textAlign = 'center';
@@ -660,6 +709,7 @@ export function createMatch({ teams }) {
       ctx.restore();
       x += w;
     });
+    ctx.restore();
     if (disallowed) { ctx.restore(); return; }
     // Scorer card
     const pl = playerByName(side, sc.ev.ownGoal ? null : sc.ev.player);
@@ -1376,5 +1426,30 @@ function sampleLook(img) {
   const skin = face ? hex(face) : '#c8956b';
   let hairC = hair ? hex(hair) : null;
   if (hair && face && Math.abs(hair[0] - face[0]) + Math.abs(hair[1] - face[1]) < 40) hairC = null; // bald / shaved
-  return { skin, hair: hairC };
+  return { skin, hair: hairC, faceXf: faceFraming(img) };
+}
+
+// Where the head sits in the portrait: Transfermarkt crops tightly (head ≈ 84% of the width,
+// touching the top). Measure the silhouette width and centre at forehead height and map the 3D
+// head onto it ([u scale, u offset, v scale, v offset] for the face shader).
+function faceFraming(img) {
+  const W = 75, H = 98;
+  const c = document.createElement('canvas'); c.width = W; c.height = H;
+  const x = c.getContext('2d', { willReadFrequently: true });
+  x.drawImage(img, 0, 0, W, H);
+  const d = x.getImageData(0, 0, W, H).data;
+  const at = (xx, yy, k) => d[(yy * W + xx) * 4 + k];
+  const bg = [0, 1, 2].map(k => (at(1, 1, k) + at(W - 2, 1, k) + at(1, 5, k) + at(W - 2, 5, k)) / 4);
+  const fg = (xx, yy) => Math.abs(at(xx, yy, 0) - bg[0]) + Math.abs(at(xx, yy, 1) - bg[1]) + Math.abs(at(xx, yy, 2) - bg[2]) > 60;
+  const ws = [], cs = [];
+  for (let yy = Math.round(H * 0.14); yy < Math.round(H * 0.24); yy++) {
+    let a = -1, b = -1;
+    for (let xx = 0; xx < W; xx++) if (fg(xx, yy)) { if (a < 0) a = xx; b = xx; }
+    if (a >= 0 && b - a > 4) { ws.push((b - a) / W); cs.push((a + b) / 2 / W); }
+  }
+  const med = v => v.sort((p, q) => p - q)[Math.floor(v.length / 2)];
+  const w = ws.length ? med(ws) : 0.84, cx = cs.length ? med(cs) : 0.5;
+  const su = Math.min(0.97, Math.max(0.76, 0.86 * (w / 0.84)));
+  const ou = Math.min(0.2, Math.max(-0.05, cx - su / 2));
+  return [su, ou, 0.78, 0.14];
 }

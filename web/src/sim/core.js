@@ -276,6 +276,13 @@ export function simulate(plan) {
         const vMax = cur.type === 'shot' ? (cur.speed || 30) : cur.loft ? 24 : 21;
         cur.dur = Math.max(cur.dur, d / vMax);
       }
+      if (cur.type === 'shot' || cur.type === 'pass' || cur.type === 'free') {
+        // Gravity: a ball in the air for T seconds rises g·T²/8 above the straight line between
+        // its start and end heights — lofted balls follow that arc instead of floating.
+        const g8 = 9.81 * cur.dur * cur.dur / 8;
+        if (cur.loft) cur.loft = Math.min(cur.loft, Math.max(g8, 1.6));
+        else if (cur.type === 'shot' && (cur.to.z || 0) > 0.5) cur.loft = g8 * 0.6;
+      }
       if (cur.type === 'gkhold') {
         const a = cur.agent, d = Math.hypot(P[a * 2] - ballPos.x, P[a * 2 + 1] - ballPos.y);
         if (d < 1.8) carrier = a; else rollTo = a;
@@ -461,6 +468,28 @@ export function simulate(plan) {
       pos[o * 2] = P[a * 2]; pos[o * 2 + 1] = P[a * 2 + 1];
       hd[o] = H[a]; ph[o] = PH[a];
       st[o] = sCode; stT[o] = sAt ? tp - sAt.t0 : 0;
+    }
+    // Bodies don't overlap: players (and the referee) closer than ~0.6 m are pushed apart, unless
+    // they're in a contact action (tackle, fall, dive, keeper holding the ball).
+    for (let a = 0; a <= REF; a++) {
+      if (a < 22 && sent.has(a)) continue;
+      const sa = st[k * N_AGENTS + a];
+      if (FREE_STATES.has(sa) || sa === S.LUNGE || sa === S.HOLD) continue;
+      for (let b2 = a + 1; b2 <= REF; b2++) {
+        if (b2 < 22 && sent.has(b2)) continue;
+        const sb = st[k * N_AGENTS + b2];
+        if (FREE_STATES.has(sb) || sb === S.LUNGE || sb === S.HOLD) continue;
+        const dx = P[a * 2] - P[b2 * 2], dy = P[a * 2 + 1] - P[b2 * 2 + 1], d2 = dx * dx + dy * dy;
+        if (d2 >= 0.4 || d2 < 1e-8) continue;
+        // eased apart over a few ticks (no jolts): at most ~1 m/s of sideways give
+        const d = Math.sqrt(d2), push = Math.min(0.03, (0.63 - d) * 0.18), ux = dx / d, uy = dy / d;
+        // the ball carrier holds his line; the other body gives way
+        const wa = carrier === a ? 0.2 : carrier === b2 ? 1.8 : 1, wb = 2 - wa;
+        P[a * 2] += ux * push * wa; P[a * 2 + 1] += uy * push * wa;
+        P[b2 * 2] -= ux * push * wb; P[b2 * 2 + 1] -= uy * push * wb;
+        pos[(k * N_AGENTS + a) * 2] = P[a * 2]; pos[(k * N_AGENTS + a) * 2 + 1] = P[a * 2 + 1];
+        pos[(k * N_AGENTS + b2) * 2] = P[b2 * 2]; pos[(k * N_AGENTS + b2) * 2 + 1] = P[b2 * 2 + 1];
+      }
     }
     if (k + 1 < N) {
       const lA = offsideLineX(pos.subarray(k * N_AGENTS * 2), 'A', M, sent);

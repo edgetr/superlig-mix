@@ -7,6 +7,7 @@ export const SPEC = [
   { name: 'run_fast', id: '127_07', kind: 'cycle' },
   { name: 'sprint', id: '127_08', kind: 'cycle' },
   { name: 'walk_back', id: '136_25', kind: 'cycle', at: 6 },
+  { name: 'side_l', id: '143_40', kind: 'cycle', at: 2.5 },       // side-step to the left (mirrored for right)
   // standing idle (looped)
   { name: 'idle', id: '113_21', kind: 'action', t0: 1.0, t1: 9.0, ref: 1.0, fps: 30, loop: 1.0, sigma: 2 },
   // soccer kicks, right foot; ref = boot meets ball (peak toe speed)

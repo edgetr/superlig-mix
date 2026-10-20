@@ -42,7 +42,8 @@ async function createStage() {
   scene.add(hemi);
   const key = new THREE.DirectionalLight('#fff6e8', 2.1);
   key.castShadow = true;
-  key.shadow.mapSize.set(4096, 4096);
+  const mobile = typeof matchMedia !== 'undefined' && matchMedia('(pointer: coarse)').matches;
+  key.shadow.mapSize.set(mobile ? 2048 : 4096, mobile ? 2048 : 4096);
   key.shadow.bias = -0.0004; key.shadow.normalBias = 0.02;
   Object.assign(key.shadow.camera, { left: -48, right: 48, top: 48, bottom: -48, near: 1, far: 260 });
   key.shadow.radius = 2.5;
@@ -206,7 +207,8 @@ async function createStage() {
         let t = faceTex.get(img);
         if (!t) { t = new THREE.Texture(img); t.colorSpace = THREE.SRGBColorSpace; t.anisotropy = 4; t.needsUpdate = true; faceTex.set(img, t); }
         u.uFace.value = t; u.uHasFace.value = 1;
-        u.uFaceXf.value.set(0.86, 0.07, 0.78, 0.14);
+        const xf = lk.faceXf || [0.86, 0.07, 0.78, 0.14];
+        u.uFaceXf.value.set(xf[0], xf[1], xf[2], xf[3]);
       } else u.uHasFace.value = 0;
       const h = lk.height || 1.8;
       p.g.scale.setScalar(h / body.height);

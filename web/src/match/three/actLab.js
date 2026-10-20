@@ -15,7 +15,7 @@ for (let k = 0; k < N; k++) {
   const t = k / HZ;
   const v = t < t0 ? v0 : vAfter * Math.max(0, 1 - (t - t0) * Number(qs.get('decel') || 0));
   x += v / HZ; ph += (v / HZ) / cyc(v);
-  for (let a = 0; a < A; a++) { clip.pos[(k * A + a) * 2] = a === 0 ? x : -30; clip.pos[(k * A + a) * 2 + 1] = 34; clip.hd[k * A + a] = 0; clip.ph[k * A + a] = ph; }
+  for (let a = 0; a < A; a++) { clip.pos[(k * A + a) * 2] = a === 0 ? x : -30; clip.pos[(k * A + a) * 2 + 1] = 34; clip.hd[k * A + a] = Number(qs.get('hd') || 0); clip.ph[k * A + a] = ph; }
   if (t >= t0 && t <= t1) { clip.st[k * A] = st; clip.stT[k * A] = t - t0; }
   // ball: at the feet before a kick, then flies
   const kickT = t0 + 0.28;

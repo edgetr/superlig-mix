@@ -4,7 +4,8 @@
 import * as THREE from 'three';
 
 const VERT_DECL = /* glsl */`
-uniform float uSleeve, uShortsLen, uSockTop, uWaist;
+uniform float uSleeve, uShortsLen, uSockTop, uWaist, uHasHair, uHairVol;
+uniform vec4 uHead;
 attribute float region;
 attribute float armT;
 attribute float legT;
@@ -19,11 +20,24 @@ float clothInflate(float region, vec3 p, float arm, float leg) {
   if (r > 0.5 && r < 1.5) {
     float neck = smoothstep(0.065, 0.085, length(vec2(p.x, p.z - 0.0)));
     float shorts = 1.0 - smoothstep(uWaist - 0.01, uWaist + 0.01, p.y);
-    return mix(0.011 * (p.y > 1.40 ? neck : 1.0), 0.024, shorts);
+    // A shirt hangs from the chest: fill the crease under the pecs and the waist so the cloth
+    // reads as fabric, not skin.
+    float front = smoothstep(0.1, 0.6, normal.z);
+    float crease = exp(-pow((p.y - 1.235) / 0.06, 2.0)) * 0.02 + smoothstep(1.24, 1.05, p.y) * smoothstep(0.95, 1.05, p.y) * 0.012;
+    float sides = exp(-pow((p.y - 1.12) / 0.12, 2.0)) * 0.014;
+    return mix(0.011 * (p.y > 1.40 ? neck : 1.0) + crease * front + sides, 0.024, shorts);
   }
   if (r > 1.5 && r < 2.5) return arm < uSleeve ? 0.012 : 0.0;
   if (r > 2.5 && r < 3.5) return leg < uShortsLen ? 0.026 * (1.0 - smoothstep(uShortsLen - 0.12, uShortsLen, leg) * 0.35) : (leg > uSockTop ? 0.004 : 0.0);
   if (r > 3.5) return p.y < 0.11 ? 0.006 : 0.004;
+  // Hair has volume: the scalp is pushed out where the hair cap is (thicker on top).
+  if (r < 0.5 && uHasHair > 0.5) {
+    float v = (p.y - uHead.x) / (uHead.y - uHead.x);
+    float back = smoothstep(0.15, -0.55, normal.z);
+    float cap = mix(0.80, 0.42, back);
+    float h = smoothstep(cap - 0.06, cap + 0.08, v);
+    return h * uHairVol * (0.55 + 0.45 * smoothstep(0.85, 1.0, v));
+  }
   return 0.0;
 }
 `;
@@ -138,7 +152,7 @@ export function createKitMaterial(body) {
     uGlove: { value: col('#f1f5f9') }, uTrim: { value: col('#ffffff') },
     uSleeve: { value: 0.27 }, uShortsLen: { value: 0.33 }, uSockTop: { value: 0.56 },
     uWaist: { value: 0.97 }, uNeckY: { value: 1.455 },
-    uHasHair: { value: 1 }, uHasGlove: { value: 0 }, uHasFace: { value: 0 }, uPattern: { value: 0 }, uHasNum: { value: 0 },
+    uHasHair: { value: 1 }, uHairVol: { value: 0.012 }, uHasGlove: { value: 0 }, uHasFace: { value: 0 }, uPattern: { value: 0 }, uHasNum: { value: 0 },
     uHead: { value: new THREE.Vector4(body.head.chin, body.head.top, (body.head.x1 - body.head.x0) / 2, body.head.front) },
     uFaceXf: { value: new THREE.Vector4(1, 0, 1, 0) },
     uNum: { value: blankTex },
@@ -157,7 +171,7 @@ export function createKitMaterial(body) {
       .replace('#include <roughnessmap_fragment>', `#include <roughnessmap_fragment>
         roughnessFactor = kitRough;`);
   };
-  m.customProgramCacheKey = () => 'kit-v4';
+  m.customProgramCacheKey = () => 'kit-v7';
   return m;
 }
 

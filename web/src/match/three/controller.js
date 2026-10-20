@@ -11,7 +11,7 @@
 //     slide tackles, knee slides, celebrations, referee and assistant signals, walls, throw-ins.
 //  4. Leg IK keeps planted feet on the turf for crouched and kneeling poses.
 import * as THREE from 'three';
-import { S, HZ, N_AGENTS } from '../../sim/core.js';
+import { S, HZ, N_AGENTS, cycleLen } from '../../sim/core.js';
 import { makePose, sampleCycle, sampleAction, blendPose, copyPose, rotateBone } from './pose.js';
 
 const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
@@ -191,8 +191,11 @@ export function createController(lib, body) {
   // ---------------------------------------------------------------- locomotion
   const tmpA = makePose(B), tmpB = makePose(B), tmpC = makePose(B), act = makePose(B), base = makePose(B);
   function idlePose(out, t, a) { const idle = C.idle; return sampleAction(idle, (t + a * 1.37) % idle.dur, out); }
-  function locomotion(out, v, phase, t, a, fwd) {
-    if (v < 0.05 || !LOCO.length) return idlePose(out, t, a);
+  // Strides per gait cycle of the directional captures vs the engine's forward gait table,
+  // so their feet plant at the engine's gait phase too.
+  const K_SIDE = C.side_l ? cycleLen(C.side_l.speed) / (C.side_l.speed * C.side_l.dur) : 1;
+  const K_BACK = C.walk_back ? cycleLen(C.walk_back.speed) / (C.walk_back.speed * C.walk_back.dur) : 1;
+  function forwardGait(out, v, phase, t, a) {
     let lo = null, hi = null, w = 0;
     if (v <= LOCO[0].speed) { hi = LOCO[0]; w = clamp(v / LOCO[0].speed, 0, 1); }
     else {
@@ -208,11 +211,33 @@ export function createController(lib, body) {
       for (const b of STRIDE) extrapolate(out.q, b, mean, k);
       out.r[1] -= Math.min(0.05, (v - hi.speed) * 0.015);
     }
-    if (fwd < -0.2 && C.walk_back) {
-      sampleCycle(C.walk_back, phase, tmpC);
-      blendPose(out, out, tmpC, smooth((-fwd - 0.2) / 0.5) * clamp(v / 0.6, 0, 1));
-    }
     return out;
+  }
+  // phi: direction of travel relative to the body (engine angle; > 0 = towards the character's right).
+  // Returns the hip twist applied (engine radians) so the caller can keep the chest on the ball.
+  const tmpD = makePose(B), tmpE = makePose(B);
+  function locomotion(out, v, phase, t, a, phi) {
+    if (v < 0.05 || !LOCO.length) { idlePose(out, t, a); return 0; }
+    const c = Math.cos(phi), sn = Math.sin(phi);
+    // Fast and not facing the run: hips turn into the run, chest stays on the ball.
+    const twistW = smooth((v - 2.0) / 1.4) * smooth((Math.abs(phi) - 0.5) / 0.5);
+    const twist = clamp(phi, -1.75, 1.75) * twistW;
+    const rel = phi - twist, rc = Math.cos(rel), rs = Math.sin(rel);
+    forwardGait(out, v, phase, t, a);
+    let wF = Math.max(0, rc) ** 2, wB = Math.max(0, -rc) ** 2, wS = rs * rs;
+    const sum = wF + wB + wS || 1; wF /= sum; wB /= sum; wS /= sum;
+    const slow = clamp(v / 0.6, 0, 1);
+    if (wS > 0.01 && C.side_l) {
+      const clip = rs > 0 ? mirrored('side_l') : C.side_l;   // engine-positive = character's right
+      sampleCycle(clip, phase * K_SIDE, tmpD);
+      blendPose(out, out, tmpD, (wS / (wF + wS)) * slow);
+    }
+    if (wB > 0.01 && C.walk_back) {
+      sampleCycle(C.walk_back, phase * K_BACK, tmpE);
+      blendPose(out, out, tmpE, wB * slow);
+    }
+    if (twist) rotateBone(out, 0, 0, 1, 0, -twist);
+    return twist;
   }
   function extrapolate(q, b, mean, k) {
     const o = b * 4;
@@ -446,6 +471,8 @@ export function createController(lib, body) {
   const out = { pose: makePose(B), x: 0, y: 0, yaw: 0, visible: true };
   const UPPER = new Uint8Array(B);
   for (const n of ['LowerBack', 'Spine', 'Spine1', 'Neck', 'Neck1', 'Head', 'LeftShoulder', 'LeftArm', 'LeftForeArm', 'LeftHand', 'LeftFingerBase', 'LeftHandFinger1', 'LThumb', 'RightShoulder', 'RightArm', 'RightForeArm', 'RightHand', 'RightFingerBase', 'RightHandFinger1', 'RThumb']) UPPER[I[n]] = 1;
+  const LEGS = new Uint8Array(B);
+  for (const n of ['LeftUpLeg', 'LeftLeg', 'LeftFoot', 'LeftToeBase', 'RightUpLeg', 'RightLeg', 'RightFoot', 'RightToeBase']) LEGS[I[n]] = 1;
   const ARMS = new Uint8Array(B);
   for (const n of ['LeftArm', 'LeftForeArm', 'LeftHand', 'RightArm', 'RightForeArm', 'RightHand', 'Neck', 'Neck1', 'Head']) ARMS[I[n]] = 1;
 
@@ -474,9 +501,19 @@ export function createController(lib, body) {
     const acc = (Math.hypot(vB[0], vB[1]) - Math.hypot(vA[0], vA[1])) / (((Math.min(N - 1, i + 4) - Math.max(0, i - 4)) / HZ) || 1);
     const ph = clip.ph[i * A + a] + (clip.ph[j * A + a] - clip.ph[i * A + a]) * u;
     const fwd = sp > 0.05 ? (vx * Math.cos(hd) + vy * Math.sin(hd)) / sp : 1;
+    const phi = sp > 0.05 ? Math.atan2(Math.cos(hd) * vy - Math.sin(hd) * vx, vx * Math.cos(hd) + vy * Math.sin(hd)) : 0;
 
     const pose = out.pose;
-    locomotion(base, sp, ph, t, a, fwd);
+    const twist = locomotion(base, sp, ph, t, a, phi);
+    // keep the chest and eyes on the ball while the hips run elsewhere
+    if (twist) { rotateBone(base, I.Spine, 0, 1, 0, twist * 0.3); rotateBone(base, I.Spine1, 0, 1, 0, twist * 0.35); rotateBone(base, I.Neck, 0, 1, 0, twist * 0.2); rotateBone(base, I.Head, 0, 1, 0, twist * 0.15); }
+    // Turning on the spot: the feet step round with the body instead of pivoting.
+    const turnW = smooth((Math.abs(yawRate) - 0.5) / 1.5) * (1 - smooth((sp - 0.5) / 1.2));
+    if (turnW > 0.01 && C.walk) {
+      sampleCycle(C.walk, hd / 2.4, tmpC);
+      tmpC.r[1] = base.r[1];
+      blendMaskedInto(base, tmpC, turnW * 0.85, LEGS);
+    }
     // Leans: into turns (roll) and with acceleration (pitch).
     rotateBone(base, 0, 0, 0, 1, clamp(yawRate * sp * 0.035, -0.35, 0.35));
     rotateBone(base, 0, 1, 0, 0, clamp(acc * 0.025, -0.12, 0.15));
