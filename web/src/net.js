@@ -4,6 +4,8 @@ import { api } from '../../convex/_generated/api.js';
 
 export const CONVEX_URL = import.meta.env.VITE_CONVEX_URL;
 export const client = new ConvexClient(CONVEX_URL);
+// HTTP actions live on the deployment's .site host (used for the page-closing beacon).
+export const CONVEX_SITE_URL = import.meta.env.VITE_CONVEX_SITE_URL || CONVEX_URL.replace(/\.convex\.cloud\/?$/, '.convex.site');
 export { api };
 
 const SESSION_KEY = 'slmx-duel-session';

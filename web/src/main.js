@@ -1,5 +1,5 @@
 import { animate, spring, stagger } from 'motion';
-import { client, api, session, prefs, randomKey, errMsg, syncClock, serverNow, isOnline, CONVEX_URL } from './net.js';
+import { client, api, session, prefs, randomKey, errMsg, syncClock, serverNow, isOnline, CONVEX_URL, CONVEX_SITE_URL } from './net.js';
 import { createDraft, byId, esc, fmtEur, xiValue, pitchSVG } from './draft.js';
 import { createMatchScreen } from './matchScreen.js';
 import { FORMATIONS, KIT_COLORS, fitOf } from '../../shared/game.js';
@@ -110,6 +110,25 @@ function enterRoom(s) {
   history.replaceState(null, '', `/?game=${s.code}`);
   subscribe();
 }
+// Menu: leaving ends the game for both players (codes can't be rejoined once a game is over).
+async function backToMenu() {
+  if (!sess) { showHome(); return; }
+  const live = room && room.status !== 'closed' && (room.guest || room.status !== 'lobby');
+  if (live && !confirm('Back to the menu? This ends the game for both players.')) return;
+  const { roomId, key } = sess;
+  leaveRoom();
+  await Promise.race([client.mutation(api.rooms.leave, { roomId, key }), new Promise(r => setTimeout(r, 4000))]).catch(() => {});
+}
+for (const id of ['menuBar', 'menuLobby', 'menuLineups', 'menuMatch']) $('#' + id).addEventListener('click', backToMenu);
+
+// Closing the page tells the server; it ends the game unless this tab comes back (a reload) within ~20 s.
+addEventListener('pagehide', () => {
+  if (sess) navigator.sendBeacon?.(`${CONVEX_SITE_URL}/away`, JSON.stringify({ roomId: sess.roomId, key: sess.key }));
+});
+addEventListener('pageshow', e => {
+  if (e.persisted && sess) client.mutation(api.rooms.heartbeat, { roomId: sess.roomId, key: sess.key }).catch(() => {});
+});
+
 function leaveRoom() {
   unsub?.(); unsub = null;
   clearInterval(hbTimer);
@@ -134,6 +153,14 @@ function subscribe() {
 
 // ------------------------------------------------------------------ room rendering
 function onRoom(r) {
+  if (r.status === 'closed') {
+    const mine = r.closedByYou;
+    const who = r.closedBy || 'Your rival';
+    const why = r.closedReason === 'away' ? `${who} closed the game.` : r.closedReason === 'timeout' ? `${who} lost connection.` : `${who} left.`;
+    toast('Game over', mine ? 'You left this game, so it was closed.' : `${why} The game has been closed.`, 5200);
+    leaveRoom();
+    return;
+  }
   const prev = room;
   room = r;
   const screen = r.status === 'lobby' ? 'lobby' : r.status === 'draft' ? 'draft' : r.status;
@@ -203,7 +230,6 @@ $('#lobby').addEventListener('change', e => {
 });
 $('#copyCode').addEventListener('click', () => copy(room.code, 'Code'));
 $('#copyLink').addEventListener('click', () => copy(inviteLink(room.code), 'Invite link'));
-$('#leaveBtn').addEventListener('click', () => { if (confirm('Leave this game? You can rejoin with the code.')) leaveRoom(); });
 
 // ---------- header (draft)
 function aiChipHTML(r) {

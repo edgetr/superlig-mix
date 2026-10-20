@@ -8,7 +8,9 @@
  * @module
  */
 
+import type * as crons from "../crons.js";
 import type * as helper from "../helper.js";
+import type * as http from "../http.js";
 import type * as rooms from "../rooms.js";
 
 import type {
@@ -18,7 +20,9 @@ import type {
 } from "convex/server";
 
 declare const fullApi: ApiFromModules<{
+  crons: typeof crons;
   helper: typeof helper;
+  http: typeof http;
   rooms: typeof rooms;
 }>;
 

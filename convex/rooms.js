@@ -14,6 +14,7 @@ const fail = msg => { throw new ConvexError(msg); };
 async function member(ctx, roomId, key) {
   const room = await ctx.db.get(roomId);
   if (!room) fail('This room no longer exists.');
+  if (room.status === 'closed') fail('This game has ended.');
   if (key && key === room.hostKey) return { room, role: 'host' };
   if (key && key === room.guestKey) return { room, role: 'guest' };
   fail('You are not part of this room.');
@@ -30,10 +31,11 @@ function newSide(name, teamName, color) {
 
 // Sanitised room for clients (never leaks keys; only the host sees the helper's account email).
 function view(room, role) {
-  const strip = s => s && { name: s.name, teamName: s.teamName, formation: s.formation, color: s.color, xi: s.xi, lastSeen: s.lastSeen };
+  const strip = s => s && { name: s.name, teamName: s.teamName, formation: s.formation, color: s.color, xi: s.xi, lastSeen: s.lastSeen, away: !!s.awayAt };
   const c = room.companion;
   return {
     _id: room._id, code: room.code, round: room.round, status: room.status, you: role,
+    closedBy: room.closedBy ?? null, closedReason: room.closedReason ?? null, closedByYou: room.closedRole === role,
     host: strip(room.host), guest: strip(room.guest) || null,
     pickTimer: room.pickTimer, pickNo: room.pickNo, turn: room.turn, turnDeadline: room.turnDeadline ?? null,
     picks: room.picks, guestReady: room.guestReady,
@@ -100,7 +102,7 @@ export const create = mutation({
     for (let tries = 0; tries < 20; tries++) {
       code = Array.from({ length: 5 }, () => CODE_CHARS[Math.floor(Math.random() * CODE_CHARS.length)]).join('');
       const clash = await ctx.db.query('rooms').withIndex('by_code', q => q.eq('code', code)).first();
-      if (!clash || Date.now() - clash.updatedAt > 24 * 3600e3) break;
+      if (!clash || clash.status === 'closed' || Date.now() - clash.updatedAt > 24 * 3600e3) break;
     }
     const n = cleanName(name, 'Host');
     const now = Date.now();
@@ -120,6 +122,7 @@ export const join = mutation({
   handler: async (ctx, { code, key, name }) => {
     const room = await ctx.db.query('rooms').withIndex('by_code', q => q.eq('code', code.toUpperCase().trim())).order('desc').first();
     if (!room) fail('No game with that code. Check the code and try again.');
+    if (room.status === 'closed') fail('That game has ended. Ask your rival to start a new one.');
     if (room.hostKey === key) return { roomId: room._id, role: 'host' };
     if (room.guestKey === key) return { roomId: room._id, role: 'guest' };
     if (room.guestKey) fail('This game already has two players.');
@@ -146,8 +149,72 @@ export const heartbeat = mutation({
   args: { roomId: v.id('rooms'), key: v.string() },
   handler: async (ctx, { roomId, key }) => {
     const { room, role } = await member(ctx, roomId, key);
-    await ctx.db.patch(roomId, { [role]: { ...room[role], lastSeen: Date.now() } });
+    const { awayAt, ...side } = room[role];
+    await ctx.db.patch(roomId, { [role]: { ...side, lastSeen: Date.now() } });
     return Date.now();
+  },
+});
+
+// ------------------------------------------------------------------ leaving
+// A game lives only while both players have it open: leaving (Menu), closing the page, or losing
+// the connection ends it for both.
+const STALE_MS = 150_000;  // no heartbeat for this long = gone (background tabs beat ~once a minute)
+const AWAY_GRACE_MS = 20_000; // a reload sends "away" then a heartbeat within a few seconds
+
+async function closeRoom(ctx, room, role, reason) {
+  if (room.status === 'closed') return;
+  await ctx.db.patch(room._id, {
+    status: 'closed', closedBy: room[role]?.name ?? '', closedReason: reason, closedRole: role,
+    turnDeadline: undefined, guestReady: false, updatedAt: Date.now(),
+  });
+}
+
+export const leave = mutation({
+  args: { roomId: v.id('rooms'), key: v.string() },
+  handler: async (ctx, { roomId, key }) => {
+    const room = await ctx.db.get(roomId);
+    if (!room) return;
+    const role = key === room.hostKey ? 'host' : key === room.guestKey ? 'guest' : null;
+    if (role) await closeRoom(ctx, room, role, 'left');
+  },
+});
+
+// Sent by the page as it closes (navigator.sendBeacon → http.js). Closes the game unless the same
+// player comes back (a reload) within the grace period.
+export const away = internalMutation({
+  args: { roomId: v.string(), key: v.string() },
+  handler: async (ctx, { roomId, key }) => {
+    const id = ctx.db.normalizeId('rooms', roomId);
+    const room = id && await ctx.db.get(id);
+    if (!room || room.status === 'closed') return;
+    const role = key === room.hostKey ? 'host' : key === room.guestKey ? 'guest' : null;
+    if (!role) return;
+    const at = Date.now();
+    await ctx.db.patch(id, { [role]: { ...room[role], awayAt: at } });
+    await ctx.scheduler.runAfter(AWAY_GRACE_MS, internal.rooms.closeIfAway, { roomId: id, role, at });
+  },
+});
+
+export const closeIfAway = internalMutation({
+  args: { roomId: v.id('rooms'), role: v.string(), at: v.number() },
+  handler: async (ctx, { roomId, role, at }) => {
+    const room = await ctx.db.get(roomId);
+    if (room?.[role]?.awayAt === at) await closeRoom(ctx, room, role, 'away');
+  },
+});
+
+// Cron: close games where someone vanished without the page saying goodbye (crash, sleep, offline).
+export const sweep = internalMutation({
+  args: {},
+  handler: async ctx => {
+    const now = Date.now();
+    for (const status of ['lobby', 'draft', 'lineups', 'match']) {
+      const rooms = await ctx.db.query('rooms').withIndex('by_status', q => q.eq('status', status)).collect();
+      for (const room of rooms) {
+        const gone = ['host', 'guest'].find(r => room[r] && now - room[r].lastSeen > STALE_MS);
+        if (gone) await closeRoom(ctx, room, gone, 'timeout');
+      }
+    }
   },
 });
 

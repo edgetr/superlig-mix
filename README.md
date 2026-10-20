@@ -11,6 +11,7 @@ Two managers, one player pool. Take turns drafting a starting XI from the **2026
 3. **Draft** — host picks first, then you alternate (host → rival → host …) until both have 11. No position rules: pick whoever you want, in any order. A player you pick is blacked out for your rival. Optional pick timer with auto-pick.
 4. **Ready → Simulate** — the rival presses **Ready**, the host presses **Simulate**. Both line-ups appear side by side; the host presses **Continue**.
 5. **Watch** — GPT-6.1 Sol streams the match in as it writes it. Either player can pause / resume / seek / change speed for both. At full time you get stats, player ratings and an analysis of each team: strengths, weaknesses and which real Premier League / LaLiga / Serie A / Bundesliga / Ligue 1 club it plays like. **Download** the whole thing as a video (MP4, or WebM where H.264 encoding isn't available).
+6. **Menu** — the ‹ Menu button on every screen takes you back to the start. A game only lives while both players have it open: leaving through Menu, closing the tab (a reload is fine — you have ~20 s to come back) or dropping offline for 2½ minutes ends it for both, and its code can't be joined again.
 
 ## The match engine
 

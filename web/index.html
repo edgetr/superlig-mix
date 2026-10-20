@@ -13,6 +13,7 @@
 <!-- ============================================================ DRAFT (the Starting XI UI) -->
 <header class="bar" id="bar">
   <div class="brand">
+    <button class="menu-btn" id="menuBar" title="Back to the menu (ends the game)">‹ Menu</button>
     <span class="badge">TSL</span>
     <div class="brand-text">
       <input id="teamName" class="team-name" maxlength="28" spellcheck="false" aria-label="Team name">
@@ -113,12 +114,13 @@
     </div>
     <div class="lobby-row" id="aiRow"></div>
     <div class="lobby-actions" id="lobbyActions"></div>
-    <button class="link-btn" id="leaveBtn">Leave game</button>
+    <button class="link-btn" id="menuLobby">Back to menu</button>
   </div>
 </section>
 
 <!-- ============================================================ LINE-UPS (after Simulate) -->
 <section class="screen lineups" id="lineups" hidden>
+  <button class="menu-btn corner" id="menuLineups" title="Back to the menu (ends the game)">‹ Menu</button>
   <div class="lu-head">
     <span class="chip-neutral">Neutral ground · no home advantage</span>
     <h2 id="luTitle"></h2>
@@ -151,6 +153,7 @@
     </div>
   </div>
   <aside class="m-side">
+    <button class="menu-btn" id="menuMatch" title="Back to the menu (ends the game)">‹ Menu</button>
     <div class="m-score" id="mScore"></div>
     <div class="m-tabs seg" id="mTabs"></div>
     <div class="m-panel" id="mPanel"></div>
