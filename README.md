@@ -19,8 +19,9 @@ GPT-6.1 Sol writes a rules-aware match script: team tactics (line height, press,
 - **Physics:** human top speeds by role and age, acceleration that fades near top speed, braking, turning circles that widen with speed, body orientation separate from running direction (players watch the ball, back-pedal, side-shuffle), gait cycles that scale with speed.
 - **Football intelligence:** formation-based team shape driven by ball position, possession and style; a real offside line held by the back four; attackers time their runs to stay onside; pressers close down; goalkeepers guard the line between ball and goal and never leave the box; passes are played into a teammate's run, and the passer waits for the run.
 - **Laws of the Game:** kick-off (conceding team restarts), sides switch at half-time, free kicks from the foul spot with a 9.15 m wall, penalties from the spot with everyone outside the box and arc, corners from the right flag, goal kicks, throw-ins, assistant referees flag offsides, two yellows make a red (and the team plays on with ten).
-- **3D player rig:** hips, IK knees and elbows, boots, shoulders, head (skin and hair sampled from each player's photo), shirt numbers — kicks with the real preferred foot, headers, slide tackles, lunges, falls, keeper dives, knee slides, the referee's cards and the assistant's flag — all projected through broadcast, behind-the-goal and close-up cameras.
-- **Broadcast:** camera director (push-in on shots, celebration and booking close-ups), slow-motion replays from another angle, freeze-frame analysis images (pass arrows, shot line, offside line, spotlights, mini tactical map), half-time and full-time stats, player of the match, ratings and analysis. The engine runs in a Web Worker and every scene is rehearsed off-screen during the line-ups, so playback holds the display's refresh rate.
+- **3D players with motion capture** (`web/src/match/three/`): every player is a skinned human body (MakeHuman, CC0) at his real height, wearing his team's kit (name and number on the back, keeper gloves and long sleeves) with **his real face** projected from his Transfermarkt photo onto the head. Movement is real motion capture from the CMU database, retargeted to that skeleton: walk/jog/run/sprint gait cycles blended by speed and phase-locked to the distance actually covered (no foot sliding), backpedalling, leaning into turns and with acceleration, heads tracking the ball. Kicks are real soccer-kick captures (driven shots, side-foot passes, long balls, mirrored for left-footers) timed so the boot meets the ball on the frame the engine releases it; headers are real jumps peaking at contact; tripped players fall onto their chest and get up with a captured push-up. Keeper set/dive/landing, slide tackles, knee slides, celebrations, the referee's whistle/cards/pointing and the assistant's flag are posed on the same skeleton with IK.
+- **Stadium:** WebGL (three.js) floodlit pitch with anti-aliased shader-drawn markings and mowing stripes, stands with crowds, roofs and floodlights, LED boards with both team names, goals whose nets ripple where the ball hits, a stitched match ball that rolls with its travel, real-time shadows — rendered at the display's native resolution (Retina) and composited under the TV graphics.
+- **Broadcast:** camera director (main camera tracking and tilting with play, push-in on shots, celebration and booking close-ups), slow-motion replays from behind the goal and the reverse angle, freeze-frame analysis images (pass arrows, shot line, offside line, the protagonists lifted out of the dimmed picture, mini tactical map), half-time and full-time stats, player of the match, ratings and analysis. The engine runs in a Web Worker and every scene is rehearsed off-screen during the line-ups, so playback holds the display's refresh rate (144 Hz at 2560×1440 in testing). Video downloads are rendered at 1920×1080.
 
 ## Why the host runs a small helper
 
@@ -39,7 +40,9 @@ The joining player doesn't need ChatGPT, Node or anything else — just the link
 | Part | What it does |
 | --- | --- |
 | `web/` | Vite + vanilla JS front-end (Motion for UI animation). Draft board, lobby, line-ups, match player. |
-| `web/src/match/` | Deterministic canvas renderer for the match "video" + offline video export (WebCodecs via [mediabunny](https://github.com/Vanilagy/mediabunny)). |
+| `web/src/match/` | Deterministic renderer for the match "video" (scenes, TV graphics) + offline video export (WebCodecs via [mediabunny](https://github.com/Vanilagy/mediabunny)). |
+| `web/src/match/three/` | WebGL stadium and players ([three.js](https://threejs.org)): body/motion loader, kit + face shader, motion controller (mocap blending, actions, IK). |
+| `tools/mocap/` | Offline build of the player body (MakeHuman) and motion library (CMU mocap) — see its README. |
 | `convex/` | [Convex](https://convex.dev) backend: rooms, turn order and pick validation (server-side), pick timer, ready/simulate, shared playback clock, match event stream. |
 | `companion/host.mjs` | Host helper: Sign in with ChatGPT (PKCE + loopback), GPT-6.1 Sol calls, JSON Lines parsing, streaming into Convex. |
 | `shared/` | Player data (from transfermarkt.com) and formation/position rules used everywhere. |
@@ -57,6 +60,10 @@ Deploy: `npx convex deploy`, then build the web app with `VITE_CONVEX_URL` set t
 
 ## Credits
 
-Player names, positions, market values and photos: [transfermarkt.com](https://www.transfermarkt.com) (photos are linked, not redistributed). This is a fan project, not affiliated with the Süper Lig, its clubs, Transfermarkt or OpenAI. The simulations are AI fiction, just for fun.
+Player names, positions, market values and photos: [transfermarkt.com](https://www.transfermarkt.com) (photos are linked, not redistributed).
+
+3D body: [MakeHuman](http://www.makehumancommunity.org) HM08 base mesh, targets and `cmu_mb` rig from [MPFB2](https://github.com/makehumancommunity/mpfb2) — CC0 1.0.
+Motion capture: *The data used in this project was obtained from [mocap.cs.cmu.edu](http://mocap.cs.cmu.edu). The database was created with funding from NSF EIA-0196217.*
+Rendering: [three.js](https://threejs.org) (MIT). This is a fan project, not affiliated with the Süper Lig, its clubs, Transfermarkt or OpenAI. The simulations are AI fiction, just for fun.
 
 MIT licensed.

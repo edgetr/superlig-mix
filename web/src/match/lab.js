@@ -4,6 +4,10 @@ import { MOCK_TEAMS, MOCK_ITEMS } from './mock.js';
 
 const cv = document.getElementById('cv');
 const ctx = cv.getContext('2d', { alpha: false });
+if (new URLSearchParams(location.search).has('hidpi')) {
+  const fit = () => { const w = Math.min(2560, Math.round(cv.getBoundingClientRect().width * devicePixelRatio)); if (cv.width !== w) { cv.width = w; cv.height = Math.round(w * 9 / 16); } ctx.setTransform(w / W, 0, 0, w / W, 0, 0); };
+  fit(); new ResizeObserver(fit).observe(cv);
+}
 let match = createMatch({ teams: MOCK_TEAMS });
 match.setItems(MOCK_ITEMS);
 window.__lab = { createMatch, MOCK_TEAMS, MOCK_ITEMS, exportVideo, get match() { return match; }, W, H };

@@ -20,16 +20,18 @@ const tick = () => new Promise(r => setTimeout(r, 0));
  *   start/end (ms) optionally export a slice of the timeline. quality 'medium' (default, ~1.4 Mbps) or 'high'.
  * @returns {Promise<{blob: Blob, mimeType: string, extension: string, codec: string, frames: number, ms: number}>}
  */
-export async function exportVideo(match, { fps = 30, onProgress, signal, start = 0, end, quality = 'medium' } = {}) {
+export async function exportVideo(match, { fps = 30, onProgress, signal, start = 0, end, quality = 'medium', scale = 1.5 } = {}) {
   const q = quality === 'high' ? QUALITY_HIGH : QUALITY_MEDIUM;
   if (typeof VideoEncoder === 'undefined') throw new Error('This browser cannot encode video (WebCodecs unavailable). Try a recent Chrome, Edge or Safari.');
   const t0 = typeof performance !== 'undefined' ? performance.now() : 0;
   const stop = Math.min(end ?? match.duration, match.duration);
   const from = Math.max(0, Math.min(start, stop));
   const frames = Math.max(1, Math.ceil(((stop - from) / 1000) * fps));
-  const { codec, format, extension } = await pickFormat(W, H, q);
+  // 1920×1080 by default: the scene is drawn in 1280×720 units and scaled.
+  const VW = Math.round(W * scale), VH = Math.round(H * scale);
+  const { codec, format, extension } = await pickFormat(VW, VH, q);
 
-  const canvas = typeof OffscreenCanvas !== 'undefined' ? new OffscreenCanvas(W, H) : Object.assign(document.createElement('canvas'), { width: W, height: H });
+  const canvas = typeof OffscreenCanvas !== 'undefined' ? new OffscreenCanvas(VW, VH) : Object.assign(document.createElement('canvas'), { width: VW, height: VH });
   const ctx = canvas.getContext('2d', { alpha: false });
 
   const output = new Output({ format, target: new BufferTarget() });
@@ -41,6 +43,7 @@ export async function exportVideo(match, { fps = 30, onProgress, signal, start =
   try {
     for (let i = 0; i < frames; i++) {
       if (signal?.aborted) await abort();
+      ctx.setTransform(scale, 0, 0, scale, 0, 0);
       match.render(ctx, from + (i * 1000) / fps);
       await source.add(i / fps, 1 / fps);
       if (i % 10 === 0) {

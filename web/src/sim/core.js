@@ -165,7 +165,13 @@ const anim = (plan, agent, state, t0, t1, face) => { plan.states.push({ agent, s
 // Physical profile per agent: top speed from role and age, plus a little individuality.
 const ROLE_SPEED = { GK: 7.0, CB: 7.6, LB: 8.4, RB: 8.4, LWB: 8.5, RWB: 8.5, CDM: 7.8, CM: 8.0, CAM: 8.1, LM: 8.3, RM: 8.3, LW: 8.8, RW: 8.8, ST: 8.5 };
 const FREE_STATES = new Set([2, 3, 1, 11, 18, 6]); // dive L/R, fall, slide, knee slide, header: momentum-driven, not running
-const cycleLen = v => 1.2 + 0.35 * v;            // metres per full gait cycle (walk ≈ 1.7, sprint ≈ 4.2)
+// Metres per full gait cycle at a given speed, measured from the motion-capture gait cycles the
+// renderer plays (so the feet stay planted): walk 1.3 m/s ≈ 1.46 m, run 3.65 m/s ≈ 2.67 m, sprint ≈ 4.6 m.
+export const GAIT = [[0, 0.9], [1.3, 1.46], [2.93, 2.31], [3.65, 2.67], [4.44, 3.02], [4.83, 3.1], [6.5, 3.75], [9.5, 4.6]];
+export function cycleLen(v) {
+  for (let i = 1; i < GAIT.length; i++) if (v <= GAIT[i][0]) { const [a, la] = GAIT[i - 1], [b, lb] = GAIT[i]; return la + ((v - a) / (b - a)) * (lb - la); }
+  return GAIT[GAIT.length - 1][1];
+}
 
 export function simulate(plan) {
   const { M, ctx } = plan;
@@ -1257,7 +1263,7 @@ function buildFoul(plan, ev) {
   plan.marks.foul = { t: tf, at: F, fouled, offender, penalty: pen };
   caption(plan, tf + 0.3, ev.text || (pen ? 'Penalty!' : 'Foul'), pen ? 'penalty' : 'foul');
   // Referee arrives.
-  intent(plan, { agent: REF, type: 'goto', to: { x: F.x + dir * 3, y: F.y + 3 }, t0: tf + 0.3, t1: tf + 6, arrive: tf + 2.1, speed: 7 });
+  intent(plan, { agent: REF, type: 'goto', to: { x: F.x + dir * 3, y: F.y + 3 }, t0: tf + 0.3, t1: tf + 6, arrive: tf + 1.75, speed: 7 });
   let t = tf + 2.1;
   // Players gather, the offender protests.
   intent(plan, { agent: offender, type: 'goto', to: { x: F.x + dir * 2, y: F.y + 1.6 }, t0: tf + 0.9, t1: tf + 6, speed: 3 });
@@ -1267,6 +1273,8 @@ function buildFoul(plan, ev) {
     if (ev.card === 'second_yellow') { anim(plan, REF, S.CARD_Y, t, t + 1.1); anim(plan, REF, S.CARD_R, t + 1.1, t + 2.4); }
     else anim(plan, REF, card === 'red' ? S.CARD_R : S.CARD_Y, t, t + 2.2);
     plan.marks.card = { t, agent: offender, color: card, second: ev.card === 'second_yellow' };
+    // The referee stops and faces the offender to show it.
+    intent(plan, { agent: REF, type: 'stay', t0: t - 0.15, t1: t + (ev.card === 'second_yellow' ? 2.5 : 2.3) });
     caption(plan, t, `${card === 'red' ? 'RED CARD' : 'Yellow card'} — ${playerOf(M, offender).name}`, card === 'red' ? 'red' : 'yellow');
     if (card === 'red') intent(plan, { agent: offender, type: 'goto', to: { x: F.x, y: 69.5 }, t0: t + 1.6, t1: t + 8, speed: 2.4 });
     t += ev.card === 'second_yellow' ? 2.5 : 2.3;

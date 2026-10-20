@@ -14,17 +14,17 @@ export function camera(pos, look, fovDeg) {
   const right = norm3(cross([0, 0, 1], fwd));
   const up = cross(fwd, right);
   const f = (H / 2) / Math.tan((fovDeg * Math.PI) / 360);
-  return { pos, fwd, right, up, f };
+  return { pos, look, fov: fovDeg, fwd, right, up, f };
 }
 // Main TV camera: high in the stand on the near touchline, panning with play.
-export function broadcastCam(x, zoom = 1) { return camera([x, WD + 48, 29], [x, 29, 0], 27 / zoom); }
+export function broadcastCam(x, zoom = 1, ly = 29) { return camera([x, WD + 48, 29], [x, ly, 0], 22 / zoom); }
 // Replay: low behind the goal the attack is heading to.
 export function behindGoalCam(goalX, y = 34) {
   const s = goalX > L / 2 ? 1 : -1;
-  return camera([goalX + s * 21, 34 + (y - 34) * 0.35, 7.5], [goalX - s * 24, 34 + (y - 34) * 0.25, 0.8], 46);
+  return camera([goalX + s * 8.5, 34 + (y - 34) * 0.35, 5.6], [goalX - s * 24, 34 + (y - 34) * 0.25, 0.8], 56);
 }
-// Replay: reverse angle from the far side, closer.
-export function reverseCam(x, y) { return camera([x + 6, -26, 11], [x, Math.min(y + 4, 60), 0.6], 34); }
+// Replay: reverse angle from the far side, closer (camera platform in front of the far stand).
+export function reverseCam(x, y) { return camera([x + 5, -8, 8.5], [x, Math.min(y + 3, 60), 0.6], 42); }
 // Close-up cam on a point (celebrations, cards).
 export function closeCam(x, y, side = 1) { return camera([x + side * 9, y + 13, 4.2], [x, y, 1.1], 38); }
 
@@ -103,10 +103,11 @@ function texQuad(ctx, cam, img, p0, p1, p2, strips, srcW, srcH) {
     // Back-face: the textured side faces away from this camera.
     if ((qb[0] - qa[0]) * (qc[1] - qa[1]) - (qb[1] - qa[1]) * (qc[0] - qa[0]) < 0) continue;
     const sw = srcW / strips;
-    ctx.setTransform((qb[0] - qa[0]) / sw, (qb[1] - qa[1]) / sw, (qc[0] - qa[0]) / srcH, (qc[1] - qa[1]) / srcH, qa[0], qa[1]);
+    ctx.save();
+    ctx.transform((qb[0] - qa[0]) / sw, (qb[1] - qa[1]) / sw, (qc[0] - qa[0]) / srcH, (qc[1] - qa[1]) / srcH, qa[0], qa[1]);
     ctx.drawImage(img, (i * sw) % img.width, 0, Math.min(sw, img.width), srcH, 0, 0, sw + 0.6, srcH);
+    ctx.restore();
   }
-  ctx.setTransform(1, 0, 0, 1, 0, 0);
 }
 
 function poly(ctx, cam, pts) {

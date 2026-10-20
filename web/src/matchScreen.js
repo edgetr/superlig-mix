@@ -16,6 +16,16 @@ export function createMatchScreen({ client, api, getSess, toast, serverNow }) {
   const canvas = $('#matchCanvas');
   canvas.width = W; canvas.height = H;
   const ctx = canvas.getContext('2d', { alpha: false });
+  // Render at the display's real resolution (Retina etc.); the scene is drawn in 1280×720 units.
+  function fitCanvas() {
+    const r = canvas.getBoundingClientRect();
+    const dpr = window.devicePixelRatio || 1;
+    const w = Math.max(W, Math.min(2560, Math.round(r.width * dpr) || W));
+    const h = Math.round((w * H) / W);
+    if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; lastDrawT = -1; }
+    ctx.setTransform(w / W, 0, 0, w / W, 0, 0);
+  }
+  if (typeof ResizeObserver !== 'undefined') new ResizeObserver(() => fitCanvas()).observe(canvas);
   let room = null, visible = false;
   let match = null, jobId = null, items = [], unsubEvents = null;
   let raf = 0, lastDrawT = -1, lastDrawLen = -1;
@@ -31,7 +41,7 @@ export function createMatchScreen({ client, api, getSess, toast, serverNow }) {
   function teamsFrom(r) {
     const team = s => ({
       name: s.teamName, color: s.color, formation: s.formation,
-      players: s.xi.map((id, i) => { const p = byId.get(id); return { id, name: p.name, role: FORMATIONS[s.formation][i][0], img: p.img, value: p.value, num: p.num ?? null, foot: p.foot ?? null, age: p.age ?? null, club: p.clubName }; }),
+      players: s.xi.map((id, i) => { const p = byId.get(id); return { id, name: p.name, role: FORMATIONS[s.formation][i][0], img: p.img, value: p.value, num: p.num ?? null, foot: p.foot ?? null, age: p.age ?? null, height: p.height ?? null, club: p.clubName }; }),
     });
     return { A: team(r.host), B: team(r.guest) };
   }

@@ -8,7 +8,7 @@ function team(name, color, formation, names) {
     name, color, formation,
     players: names.map((n, i) => {
       const p = byName(n) || PLAYERS[i];
-      return { id: p.id, name: p.name, role: FORMATIONS[formation][i][0], img: p.img, value: p.value, num: p.num, foot: p.foot, age: p.age, club: p.clubName };
+      return { id: p.id, name: p.name, role: FORMATIONS[formation][i][0], img: p.img, value: p.value, num: p.num, foot: p.foot, age: p.age, height: p.height, club: p.clubName };
     }),
   };
 }

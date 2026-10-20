@@ -78,8 +78,10 @@ export function createMatch({ teams }) {
   let built = { n: 0, scenes: [], tl: [], moments: [], state: null };
   let complete = false;
   let meta = null, stats = null, ratings = null, analysis = { A: null, B: null };
-  const photos = new Map();   // player id → HTMLImageElement
+  const photos = new Map();   // player id → small avatar canvas (HUD graphics)
+  const photoImgs = new Map(); // player id → decoded photo (face texture for the 3D players)
   const looks = new Map();    // player id → { skin, hair }
+  let stage3d = null;         // WebGL stadium + mocap players (null → 2D fallback renderer)
   let M0 = C.makeMatch(TEAMS, null);
   const kits = makeKits(TEAMS);
 
@@ -368,7 +370,7 @@ export function createMatch({ teams }) {
     };
   }
   function agentLook(a) {
-    if (a >= 22) return { ...kits.ref, skin: '#c8956b', hair: '#2b1d14', num: null, boots: '#111111', foot: 'right' };
+    if (a >= 22) return { ...kits.ref, skin: ['#c8956b', '#e0b48f', '#8d5a3b'][a - 22], hair: ['#2b1d14', '#3b2a1e', '#111111'][a - 22], num: null, boots: '#111111', foot: 'right', height: [1.82, 1.78, 1.80][a - 22] };
     const side = a < 11 ? 'A' : 'B';
     const slot = a - (side === 'A' ? 0 : 11);
     const p = TEAMS[side].players[slot];
@@ -376,11 +378,18 @@ export function createMatch({ teams }) {
     const kit = role === 'GK' ? kits['gk' + side] : kits[side];
     const lk = looks.get(p.id) || { skin: '#c8956b', hair: '#2b1d14' };
     const gk = role === 'GK';
-    return { ...kit, skin: lk.skin, hair: lk.hair, num: p.num ?? slot + 1, name: p.name, id: p.id, side, foot: p.foot || 'right',
+    return { ...kit, skin: lk.skin, hair: lk.hair, num: p.num ?? slot + 1, name: p.name, id: p.id, side, foot: p.foot || 'right', height: p.height ? p.height / 100 : 1.8,
       boots: ['#111111', '#f8fafc', '#facc15', '#ef4444', '#22d3ee'][(Number(p.id) || slot) % 5], gloves: gk ? '#f8fafc' : null, longSleeve: gk };
   }
-  let lookCache = null;
-  const allLooks = () => (lookCache ||= Array.from({ length: 25 }, (_, a) => agentLook(a)));
+  let lookCache = null, lookVersion = 0;
+  const allLooks = () => (lookCache ||= (lookVersion++, Array.from({ length: 25 }, (_, a) => agentLook(a))));
+  function use3D() {
+    if (!stage3d || (typeof window !== 'undefined' && window.__force2D)) return null;
+    const lk = allLooks();
+    stage3d.setCast(`${TEAMS.A.name}|${TEAMS.B.name}|${TEAMS.A.color}|${TEAMS.B.color}|${looks.size}|${photoImgs.size}`, lk, photoImgs,
+      { texts: [TEAMS.A.name.toUpperCase(), TEAMS.B.name.toUpperCase(), 'SÜPER LIG MIX'], colors: [TEAMS.A.color, TEAMS.B.color] });
+    return stage3d;
+  }
 
   // ---------------------------------------------------------------- frame rendering
   const scratch = Array.from({ length: 26 }, () => ({}));
@@ -423,7 +432,7 @@ export function createMatch({ teams }) {
         const w = Math.max(0, 1 - Math.abs(ct - m.foul.t) / 1.6);
         if (w > 0) { cx = lerp(cx, clamp(m.foul.at.x, 21, 84), smooth(w)); z = lerp(z, 1.4, smooth(w)); }
       }
-      return D.broadcastCam(cx, z);
+      return D.broadcastCam(cx, z, lookY(c, ct));
     }
     if (mode === 'goal') {
       const side = sc.ev.side || 'A', dir = sc.M.dir[side];
@@ -432,7 +441,16 @@ export function createMatch({ teams }) {
     if (mode === 'reverse') return D.reverseCam(bx, by);
     if (mode === 'close') return D.closeCam(bx, by, 1);
     const cx = lerp(c.cam[i * 2], c.cam[j * 2], a), z = lerp(c.cam[i * 2 + 1], c.cam[j * 2 + 1], a);
-    return D.broadcastCam(cx, z);
+    return D.broadcastCam(cx, z, lookY(c, ct));
+  }
+  // The main camera tilts gently towards the ball's side of the pitch (smoothed over ~1.5 s).
+  function lookY(c, ct) {
+    let y = 0, w = 0;
+    for (let k = -8; k <= 8; k++) {
+      const tt = clamp(ct + k * 0.1, 0, c.dur), f = Math.min(c.N - 1, Math.round(tt * HZ)), ww = 1 - Math.abs(k) / 9;
+      y += c.ball[f * 3 + 1] * ww; w += ww;
+    }
+    return 29 + (y / w - 34) * 0.5;
   }
 
   function drawClip(ctx, sc, ct, mode, opts = {}) {
@@ -440,14 +458,20 @@ export function createMatch({ teams }) {
     ct = clamp(ct, 0, c.dur - 0.001);
     const cam = clipCamera(sc, ct, mode);
     const f = ct * HZ, i = Math.min(Math.floor(f), c.N - 1), j = Math.min(i + 1, c.N - 1), a = f - Math.floor(f);
-    D.drawStadium(ctx, cam, ct);
-    D.drawPitch(ctx, cam);
-    // Goals (net ripple after a goal)
+    const S3 = use3D();
     const goalT = c.marks.goalT, net = c.marks.netAt;
-    for (const gx of [0, C.L]) {
-      let ripple = null;
-      if (goalT != null && ct > goalT && net && Math.abs(net.x - gx) < 1) ripple = { at: net, t: ct - goalT };
-      D.drawGoal(ctx, cam, gx, ripple);
+    if (S3) {
+      const ripple = goalT != null && ct > goalT && net ? { x: net.x, at: net, t: ct - goalT } : null;
+      S3.draw(ctx, cam, c, ct, { ripple, looks: allLooks() });
+    } else {
+      D.drawStadium(ctx, cam, ct);
+      D.drawPitch(ctx, cam);
+      // Goals (net ripple after a goal)
+      for (const gx of [0, C.L]) {
+        let ripple = null;
+        if (goalT != null && ct > goalT && net && Math.abs(net.x - gx) < 1) ripple = { at: net, t: ct - goalT };
+        D.drawGoal(ctx, cam, gx, ripple);
+      }
     }
     // Agents + ball, depth-sorted
     const L = allLooks();
@@ -469,23 +493,26 @@ export function createMatch({ teams }) {
       s.hd = c.hd[o] + dh * a; s.ph = lerp(c.ph[o], c.ph[o2], a);
       s.st = c.st[o]; s.stT = c.stT[o] + (c.st[o] === c.st[o2] ? a / HZ : 0);
       D.project(cam, x, y, 0, pj); s.sx = pj[0]; s.sy = pj[1]; s.depth = pj[2];
+      if (S3) { D.project(cam, x, y, (L[ag].height || 1.8), pj); s.hx = pj[0]; s.hy = pj[1] + 8; }
+      else s.hx = null;
       items.push(s);
     }
     const ball = scratch[25];
     ball.ag = -1; ball.x = lerp(c.ball[i * 3], c.ball[j * 3], a); ball.y = lerp(c.ball[i * 3 + 1], c.ball[j * 3 + 1], a); ball.z = lerp(c.ball[i * 3 + 2], c.ball[j * 3 + 2], a);
     D.project(cam, ball.x, ball.y, 0, pj); ball.depth = pj[2] - 0.3;
-    items.push(ball);
-    items.sort((p, q) => q.depth - p.depth);
     let carrier = -1, cd = 1.3;
     for (const s of items) if (s.ag >= 0 && s.ag < 22 && ball.z < 0.6) { const d = Math.hypot(s.x - ball.x, s.y - ball.y); if (d < cd) { cd = d; carrier = s.ag; } }
-    for (const s of items) {
-      if (s.ag < 0) { D.drawBall(ctx, cam, s.x, s.y, s.z, (s.x + s.y) * 1.3); continue; }
-      const k = D.scaleAt(cam, s.x, s.y);
-      if (s.sx < -60 || s.sx > W + 60) continue;
-      s.look = L[s.ag];
-      s.diveY = s.st === C.S.DIVE_L ? -1 : 1;
-      const hp = D.drawRig(ctx, cam, s, ct);
-      s.hx = hp[0]; s.hy = hp[1];
+    items.push(ball);
+    if (!S3) {
+      items.sort((p, q) => q.depth - p.depth);
+      for (const s of items) {
+        if (s.ag < 0) { D.drawBall(ctx, cam, s.x, s.y, s.z, (s.x + s.y) * 1.3); continue; }
+        if (s.sx < -60 || s.sx > W + 60) continue;
+        s.look = L[s.ag];
+        s.diveY = s.st === C.S.DIVE_L ? -1 : 1;
+        const hp = D.drawRig(ctx, cam, s, ct);
+        s.hx = hp[0]; s.hy = hp[1];
+      }
     }
     // Name tag over the ball carrier (broadcast style)
     if (!opts.noTags && carrier >= 0) {
@@ -493,7 +520,7 @@ export function createMatch({ teams }) {
       const lk = L[carrier];
       if (s && s.hx != null) D.drawTag(ctx, s.hx, s.hy + 2.05 * D.scaleAt(cam, s.x, s.y) - 6, D.scaleAt(cam, s.x, s.y), `${lk.num ?? ''} ${surname(lk.name)}`.trim(), lk.side === 'A' ? TEAMS.A.color : TEAMS.B.color);
     }
-    return { cam, items, ball, i };
+    return { cam, items, ball, i, S3 };
   }
 
   // ---------------------------------------------------------------- HUD
@@ -677,7 +704,7 @@ export function createMatch({ teams }) {
   // ---------------------------------------------------------------- freeze-frame analysis image
   function drawFreeze(ctx, sc, local) {
     const c = sc.clip, at = sc.at;
-    const { cam, items } = drawClip(ctx, sc, at, 'live', { noTags: true });
+    const { cam, items, S3 } = drawClip(ctx, sc, at, 'live', { noTags: true });
     const p = clamp(local / 600, 0, 1);
     // Dim + vignette
     ctx.fillStyle = `rgba(0,0,0,${0.38 * p})`; ctx.fillRect(0, 0, W, H);
@@ -707,6 +734,8 @@ export function createMatch({ teams }) {
     }
     // Spotlights + chips on the protagonists
     const prot = (c.info.protagonists || []).filter(a => a != null).slice(0, 3);
+    // Lift the protagonists out of the dimmed picture.
+    if (S3) { ctx.globalAlpha = 1; S3.draw(ctx, cam, c, at, { only: new Set(prot), transparent: true, looks: allLooks() }); ctx.globalAlpha = p; }
     prot.forEach((ag, i) => {
       const s = items.find(q => q.ag === ag); if (!s) return;
       const sCol = ag < 11 ? TEAMS.A.color : TEAMS.B.color;
@@ -714,7 +743,7 @@ export function createMatch({ teams }) {
       const lk = allLooks()[ag];
       // redraw the figure over the dim
       const k = D.scaleAt(cam, s.x, s.y);
-      D.drawRig(ctx, cam, s, at);
+      if (!S3) D.drawRig(ctx, cam, s, at);
       chip(ctx, s.sx, s.sy - 2.2 * k - 46, lk, sCol, i === 0);
     });
     ctx.globalAlpha = 1;
@@ -1249,6 +1278,7 @@ export function createMatch({ teams }) {
   function preload() { return (preloadP ||= preloadOnce()); }
   async function preloadOnce() {
     if (!crownReady) { D.buildTextures([TEAMS.A.color, TEAMS.B.color], [TEAMS.A.name.toUpperCase(), TEAMS.B.name.toUpperCase(), 'SÜPER LIG MIX']); crownReady = true; }
+    const stageP = import('./three/stage.js').then(m => m.getStage()).catch(e => { console.warn('3D renderer unavailable, using 2D', e); return null; });
     const all = [...TEAMS.A.players, ...TEAMS.B.players];
     await Promise.all(all.map(p => new Promise(res => {
       if (!p.img) return res();
@@ -1260,11 +1290,13 @@ export function createMatch({ teams }) {
         // Pre-render a small avatar once: drawing big photos mid-playback forces a decode + GPU upload.
         const av = document.createElement('canvas'); av.width = 160; av.height = 208;
         av.getContext('2d').drawImage(img, 0, 0, 160, 208);
-        photos.set(p.id, av); try { looks.set(p.id, sampleLook(img)); } catch {} lookCache = null; res();
+        photos.set(p.id, av); photoImgs.set(p.id, img); try { looks.set(p.id, sampleLook(img)); } catch {} lookCache = null; res();
       };
       img.onerror = () => res();
       img.src = p.img;
     })));
+    stage3d = await stageP;
+    lookCache = null;
     montageCache = null; thumbCache.clear(); warmed.clear();
     scheduleWarm();
   }
@@ -1292,7 +1324,7 @@ export function createMatch({ teams }) {
       { kind: 'end', data: {} },
     ];
     const rh = createMatch({ teams: TEAMS });
-    rh.__shareAssets(photos, looks);
+    rh.__shareAssets(photos, looks, photoImgs, stage3d);
     rh.setItems(script);
     await rh.ready();
     const cv = Object.assign(document.createElement('canvas'), { width: W, height: H });
@@ -1305,8 +1337,9 @@ export function createMatch({ teams }) {
     }
   }
   return {
+    __internal: () => ({ built, stage3d, allLooks, C }),
     rehearse,
-    __shareAssets(ph, lk) { ph.forEach((v, k) => photos.set(k, v)); lk.forEach((v, k) => looks.set(k, v)); lookCache = null; crownReady = true; },
+    __shareAssets(ph, lk, imgs, st) { ph.forEach((v, k) => photos.set(k, v)); lk.forEach((v, k) => looks.set(k, v)); imgs?.forEach((v, k) => photoImgs.set(k, v)); if (st) stage3d = st; lookCache = null; crownReady = true; },
     setItems,
     get duration() { return duration(); },
     get complete() { return complete; },
